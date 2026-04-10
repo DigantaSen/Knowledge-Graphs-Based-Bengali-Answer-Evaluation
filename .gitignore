@@ -1,0 +1,87 @@
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# ─── Virtual environments ─────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ─── Trained model weights (large binary files) ───────────────────────────────
+models/
+*.pth
+*.pt
+*.pkl
+*.joblib
+*.h5
+*.onnx
+
+# ─── Dataset files (large CSVs) ───────────────────────────────────────────────
+data/
+*.csv
+
+# ─── Zip archives ─────────────────────────────────────────────────────────────
+*.zip
+
+# ─── Generated results directories ───────────────────────────────────────────
+results/
+
+# ─── Jupyter notebook checkpoints ────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ─── Matplotlib / plot cache ─────────────────────────────────────────────────
+*.png
+*.pdf
+*.svg
+
+# ─── HuggingFace / Torch hub cache ───────────────────────────────────────────
+.cache/
+hub/
+
+# ─── Logs and temp files ─────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# ─── OS artefacts ────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── IDEs ────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ─── Build / distribution ────────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+.eggs/
+site/
+
+# ─── Coverage / testing ──────────────────────────────────────────────────────
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# ─── Environment files (secrets) ─────────────────────────────────────────────
+.env
+.env.*
+secrets.json
+
+# ─── Exceptions (files to keep despite broad ignores above) ────────────
+# Keep the project report PDF
+!report.pdf
+# Keep the empty models/ directory as a download target
+!models/.gitkeep

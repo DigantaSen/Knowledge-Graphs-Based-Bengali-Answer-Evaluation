@@ -1,79 +1,66 @@
 """
-config.py - Global configuration, constants, and dataset path resolution.
+config.py
+=========
+Global configuration constants for the Bengali Answer Evaluation System.
+Centralises all hardcoded paths, model names, and hyper-parameters so that
+any future changes only need to be made here.
 """
 
 import os
-import glob
 
-CSV_FILENAME = "bengali_answer_evaluation_dataset.csv"
-AUGMENTED_CSV = "bengali_answer_evaluation_dataset_augmented.csv"
+# ─── Environment detection ────────────────────────────────────────────────────
+IS_KAGGLE = os.path.exists("/kaggle/input")
 
-GNN_MODEL_PATH = "nlp_dominator_gnn.pth"
-SCORER_MODEL_PATH = "nlp_dominator_scorer.pkl"
+# ─── Base data directory ──────────────────────────────────────────────────────
+# Locally datasets live in  <project_root>/data/
+# On Kaggle they come from  /kaggle/input/<dataset-name>/
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
-SENTENCE_MODEL_NAME = "sentence-transformers/LaBSE"
-NODE_MODEL_NAME = "csebuetnlp/banglabert"
-NER_MODEL_NAME = "Davlan/bert-base-multilingual-cased-ner-hrl"
-
-GNN_EPOCHS = 5
-GNN_EPOCHS_CV = 3
-TEST_SIZE = 0.2
-NUM_ADVERSARIAL = 50
-RANDOM_STATE = 42
-CV_SPLITS = 5
-
-ENSEMBLE_WEIGHTS = (0.6, 0.4)
-SYNONYM_THRESHOLD = 0.75
-
-PLOT_CORRELATION = "correlation_plot.png"
-PLOT_CONFUSION = "confusion_matrices.png"
-PLOT_ERROR_DIST = "error_distribution.png"
-PLOT_SCORE_DIST = "score_distributions.png"
-PLOT_ABLATION = "ablation_bar_charts.png"
-PLOT_SCATTER = "scatter_comparison.png"
-PLOT_SUBJECT = "per_subject_comparison.png"
-PLOT_INCREMENTAL = "incremental_ablation.png"
-
-
-def resolve_dataset_path() -> str:
-    """
-    Locate the original CSV on both Kaggle and local environments.
-    Returns the absolute path to the CSV file.
-    Raises FileNotFoundError if the file cannot be found.
-    """
-    kaggle_candidates = [
-        f"/kaggle/input/bengali_answer_evaluation_dataset/{CSV_FILENAME}",
-        f"/kaggle/input/bengali-answer-evaluation-dataset/{CSV_FILENAME}",
-        f"/kaggle/input/bengalianswerevaluationdataset/{CSV_FILENAME}",
+# ─── Dataset paths ────────────────────────────────────────────────────────────
+if IS_KAGGLE:
+    KAGGLE_INPUT_DIR = "/kaggle/input"
+    # Look through typical dataset version directories
+    DATASET_CSV_CANDIDATES = [
+        "/kaggle/input/nlp-dominator-dataset/dataset_single_sentence.csv",
+        "/kaggle/input/nlp-dominator-dataset/dataset_medium_sentences.csv",
+        "/kaggle/input/nlp-dominator-dataset/dataset_long_sentences.csv",
+        "/kaggle/input/nlp-dominator-dataset/train_data.csv",
     ]
-    for path in kaggle_candidates:
-        if os.path.exists(path):
-            print(f"✓ Running on Kaggle. Dataset found at: {path}")
-            return path
+else:
+    KAGGLE_INPUT_DIR = DATA_DIR
+    DATASET_CSV_CANDIDATES = [
+        os.path.join(DATA_DIR, "dataset_single_sentence.csv"),
+        os.path.join(DATA_DIR, "dataset_medium_sentences.csv"),
+        os.path.join(DATA_DIR, "dataset_long_sentences.csv"),
+        os.path.join(DATA_DIR, "train_data.csv"),
+    ]
 
-    if os.path.exists("/kaggle/input"):
-        matches = glob.glob(f"/kaggle/input/**/{CSV_FILENAME}", recursive=True)
-        if not matches:
-            matches = glob.glob("/kaggle/input/**/*.csv", recursive=True)
-        if matches:
-            print(f"✓ Running on Kaggle. Dataset found at: {matches[0]}")
-            return matches[0]
+# Augmented dataset output file (written next to the source CSVs)
+AUGMENTED_CSV_PATH = os.path.join(DATA_DIR, "train_data_augmented.csv")
 
-    if os.path.exists(CSV_FILENAME):
-        print(f"✓ Running locally. Dataset found at: {CSV_FILENAME}")
-        return CSV_FILENAME
+# ─── Adversarial augmentation ─────────────────────────────────────────────────
+NUM_ADVERSARIAL = 50
 
-    if os.path.exists("/kaggle/input"):
-        print("\n⚠ Dataset NOT found. Contents of /kaggle/input/:")
-        for item in sorted(os.listdir("/kaggle/input")):
-            sub = os.path.join("/kaggle/input", item)
-            print(f"  📁 {item}/")
-            if os.path.isdir(sub):
-                for f in sorted(os.listdir(sub)):
-                    print(f"      📄 {f}")
+# ─── Model identifiers ────────────────────────────────────────────────────────
+BANGLA_BERT_MODEL = "csebuetnlp/banglabert"
+LABSE_MODEL       = "sentence-transformers/LaBSE"
+NER_MODEL         = "sagorsarker/bangla-bert-base-ner"
 
-    raise FileNotFoundError(
-        f"'{CSV_FILENAME}' not found. "
-        "Add the dataset via 'Add Data' in Kaggle's right sidebar, "
-        "or place the CSV in the working directory."
-    )
+# ─── Saved model file paths ───────────────────────────────────────────────────
+# All models live inside the models/ subdirectory for a clean project root.
+GNN_MODEL_PATH    = os.path.join("models", "nlp_dominator_gnn.pth")
+SCORER_MODEL_PATH = os.path.join("models", "nlp_dominator_scorer.pkl")
+
+# ─── Training hyper-parameters ────────────────────────────────────────────────
+GNN_EPOCHS        = 5
+RANDOM_STATE      = 42
+TEST_SIZE         = 0.15          # fraction for hold-out test set
+CV_N_SPLITS       = 5             # folds for cross-validation
+
+# ─── Scoring thresholds ───────────────────────────────────────────────────────
+PASS_THRESHOLD    = 50            # scores >= this are "pass" for F1 computation
+HARD_NEG_CAP      = 35.0          # max score when negation mismatch detected
+HARD_NUM_CAP      = 40.0          # max score when numeric error detected
+
+# ─── Visualisation font ───────────────────────────────────────────────────────
+BENGALI_FONT_NAME = "Noto Sans Bengali"
