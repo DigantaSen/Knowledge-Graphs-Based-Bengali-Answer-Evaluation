@@ -8,65 +8,64 @@ augmented dataset. Also runs 5-fold cross-validation on the normal samples.
 
 Usage
 -----
-    python evaluate.py [--dataset PATH] [--gnn-model PATH] [--scorer-model PATH]
+    python evaluate.py [--dataset PATH] [--models-dir DIR]
+                       [--gnn-model PATH] [--scorer-model PATH] [--epochs N]
+                       [--group-by pair|question] [--skip-cv] [--offline]
 """
 
 import argparse
 import os
+import shutil
 
 import numpy as np
-import pandas as pd
 from sklearn.metrics import f1_score, mean_absolute_error
-from sklearn.model_selection import KFold
+from sklearn.model_selection import GroupKFold
 from scipy.stats import pearsonr
-from transformers import pipeline as hf_pipeline
 
 import torch
 
 from src.config import (
-    GNN_EPOCHS, NUM_ADVERSARIAL,
-    RANDOM_STATE, TEST_SIZE, CV_N_SPLITS,
-    GNN_MODEL_PATH, SCORER_MODEL_PATH,
+    CV_N_SPLITS, GNN_EPOCHS, MODELS_DIR, NUM_ADVERSARIAL, PASS_THRESHOLD,
+    RANDOM_STATE, SPLIT_GROUP_BY, TEST_SIZE,
+    gnn_model_filename, scorer_model_filename,
 )
-from src.data.dataset import find_dataset_csv, load_and_augment_dataset, split_dataset
-from src.evaluation.metrics import compute_full_metrics, print_regression_table
-from src.evaluation.overrides import apply_hard_overrides, compute_wrong_num_flags
+from src.data.dataset import normal_rows, split_groups, template_phrases
+from src.experiment import (
+    build_components, calibrated, fit_gnn_and_scorer, load_split, predict, report, with_synthetic,
+)
 from src.features.pipeline import (
-    create_graphs_and_features, get_gnn_similarities, train_gnn,
+    concat_features, create_graphs_and_features, get_gnn_similarities, subset_features,
 )
-from src.graph.embedder import BanglaBERTEmbedder
-from src.graph.kg_constructor import KnowledgeGraphConstructor
 from src.models.answer_scorer import AnswerScorer
 from src.models.siamese_gnn import SiameseGNN
-from src.nlp.coreference import BengaliCoreferenceResolver
-from src.nlp.dependency_parser import BengaliDependencyParser
-from src.nlp.triple_extractor import TripleExtractor
-from src.preprocessing.text_preprocessor import TextPreprocessor
+from src.utils.helpers import ensure_utf8_stdio, set_seed
 from src.utils.results_saver import ResultsSaver
-from src.validation.karak_validator import KarakValidator
 
 
 # ── HuggingFace auto-download ──────────────────────────────────────────────────
 
 _HF_REPO_ID = "k040902/bengali_question_ans"
 
-_HF_ALL_MODEL_FILES = [
-    "nlp_dominator_gnn_dataset_single_sentence.pth",
-    "nlp_dominator_gnn_dataset_medium_sentences.pth",
-    "nlp_dominator_gnn_dataset_long_sentences.pth",
-    "nlp_dominator_scorer_dataset_single_sentence.pkl",
-    "nlp_dominator_scorer_dataset_medium_sentences.pkl",
-    "nlp_dominator_scorer_dataset_long_sentences.pkl",
-]
+# Original-data models and original + clean-synthetic models, per tier
+_HF_STEMS = [f'dataset_{t}{suffix}' for suffix in ('', '_plus_clean')
+             for t in ('single_sentence', 'medium_sentences', 'long_sentences')]
+_HF_ALL_MODEL_FILES = ([gnn_model_filename(s) for s in _HF_STEMS]
+                       + [scorer_model_filename(s) for s in _HF_STEMS])
 
 
-def _ensure_model_downloaded(ds_stem: str, models_dir: str = 'models') -> None:
+def _ensure_model_downloaded(ds_stem: str, models_dir: str = MODELS_DIR) -> None:
     """
-    Ensure the GNN (.pth) and scorer (.pkl) for *ds_stem* exist in *models_dir*.
-    Downloads only the two missing files from HuggingFace.
-    Falls back to downloading all 6 files if the stem is not recognised.
+    Ensure the GNN (.pth) and scorer (.npz) for *ds_stem* exist in *models_dir*.
+    Downloads only the missing files from HuggingFace; unknown stems are skipped.
     """
     os.makedirs(models_dir, exist_ok=True)
+    stem_files = [f for f in _HF_ALL_MODEL_FILES if f.endswith(f'_{ds_stem}.pth')
+                  or f.endswith(f'_{ds_stem}.npz')]
+    missing = [f for f in stem_files if not os.path.exists(os.path.join(models_dir, f))]
+    if not stem_files or not missing:
+        if stem_files:
+            print(f'[INFO] Model files for "{ds_stem}" already present in {models_dir}/')
+        return
 
     try:
         from huggingface_hub import hf_hub_download
@@ -76,321 +75,211 @@ def _ensure_model_downloaded(ds_stem: str, models_dir: str = 'models') -> None:
               '      Model download skipped.')
         return
 
-    # Build the list of files to check for this specific stem
-    stem_files = [
-        f for f in _HF_ALL_MODEL_FILES
-        if ds_stem in f
-    ]
-    # If stem not found in known filenames, pull everything
-    if not stem_files:
-        stem_files = _HF_ALL_MODEL_FILES
-
-    missing = [
-        f for f in stem_files
-        if not os.path.exists(os.path.join(models_dir, f))
-    ]
-
-    if not missing:
-        print(f'[INFO] Model files for "{ds_stem}" already present in {models_dir}/')
-        return
-
     print(f'[INFO] {len(missing)} model file(s) missing for "{ds_stem}". '
           f'Downloading from {_HF_REPO_ID} …')
-
     for filename in missing:
         dest = os.path.join(models_dir, filename)
         print(f'  ↓  {filename} …', end=' ', flush=True)
         try:
-            import shutil
-            cached_path = hf_hub_download(
-                repo_id=_HF_REPO_ID,
-                filename=filename,
-                repo_type='model',
-                local_dir=models_dir,
-                local_dir_use_symlinks=False,
-            )
-            if os.path.abspath(cached_path) != os.path.abspath(dest):
+            cached_path = hf_hub_download(repo_id=_HF_REPO_ID, filename=filename,
+                                          repo_type='model', local_dir=models_dir)
+            # With local_dir the file usually already sits at dest; copying a
+            # file onto itself raised WinError 32 and was reported as FAILED.
+            if not os.path.exists(dest):
                 shutil.copy2(cached_path, dest)
             print(f'done  →  {dest}')
         except Exception as e:
             print(f'FAILED ({e})')
-
     print('[INFO] Download step complete.')
 
 
 def parse_args():
     p = argparse.ArgumentParser(description='Bengali Answer Evaluation — Evaluation')
     p.add_argument('--dataset',        type=str, default=None)
-    p.add_argument('--gnn-model',      type=str, default=GNN_MODEL_PATH)
-    p.add_argument('--scorer-model',   type=str, default=SCORER_MODEL_PATH)
+    p.add_argument('--models-dir',     type=str, default=MODELS_DIR,
+                   help=f'Directory with the per-dataset model files (default: {MODELS_DIR})')
+    p.add_argument('--gnn-model',      type=str, default=None,
+                   help='GNN weights (default: <models-dir>/nlp_dominator_gnn_<dataset_stem>.pth)')
+    p.add_argument('--scorer-model',   type=str, default=None,
+                   help='Scorer (default: <models-dir>/nlp_dominator_scorer_<dataset_stem>.npz)')
+    p.add_argument('--epochs',         type=int, default=GNN_EPOCHS,
+                   help=f'GNN epochs when training is needed, incl. CV (default: {GNN_EPOCHS})')
+    p.add_argument('--group-by',       choices=('pair', 'question'), default=SPLIT_GROUP_BY,
+                   help='Split unit: identical answer pairs or whole questions')
     p.add_argument('--skip-cv',        action='store_true',
                    help='Skip 5-fold cross-validation (much faster)')
     p.add_argument('--output-results', type=str, default='results',
                    help='Parent directory for run result folders (default: results)')
+    p.add_argument('--offline',        action='store_true',
+                   help='Force offline mode — use only locally cached HuggingFace models')
     return p.parse_args()
 
 
-def _build_components():
-    """Instantiate all NLP and graph components."""
-    return {
-        'text_processor':   TextPreprocessor(),
-        'dep_parser':       BengaliDependencyParser(),
-        'coref_resolver':   BengaliCoreferenceResolver(),
-        'triple_extractor': TripleExtractor(),
-        'kg_constructor':   KnowledgeGraphConstructor(),
-        'embedder':         BanglaBERTEmbedder(),
-        'validator':        KarakValidator(),
-    }
+def _run_cv(df_augmented, comps, args, saver):
+    """Grouped 5-fold CV of the full pipeline on the normal (deduplicated) rows."""
+    df_normal = normal_rows(df_augmented)
+    groups_cv = split_groups(df_normal, args.group_by)
+    print(f'\n{"="*75}')
+    print(f'  5-FOLD CROSS-VALIDATION (non-adversarial, proposed model)')
+    print(f'{"="*75}')
+    print(f'  CV pool size: {len(df_normal)} (adversarial excluded, grouped by {args.group_by})\n')
+
+    # Only the GNN and scorer are learned; every other feature is fixed per
+    # row, so features are extracted once.  Synthetic rows are built once from
+    # all references and a fold uses those whose question is in its train part.
+    cv   = create_graphs_and_features(df_normal, comps)
+    syn_df = with_synthetic(df_normal, comps['dep_parser']).iloc[len(df_normal):]
+    syn  = create_graphs_and_features(syn_df, comps) if len(syn_df) else None
+    y_cv = df_normal['human_score'].values.astype(float)
+
+    cv_pearsons, cv_maes, cv_f1s = [], [], []
+    folds = GroupKFold(n_splits=CV_N_SPLITS).split(df_normal, groups=groups_cv)
+    for fold_idx, (tr_idx, val_idx) in enumerate(folds):
+        print(f'  Fold {fold_idx+1}/{CV_N_SPLITS} — train={len(tr_idx)}, val={len(val_idx)}')
+        f_tr, f_va = subset_features(cv, tr_idx), subset_features(cv, val_idx)
+        y_f_tr, y_f_va = y_cv[tr_idx], y_cv[val_idx]
+        g_f_tr = groups_cv[tr_idx]
+        if syn is not None:
+            keep = np.where(syn_df['question'].isin(set(df_normal['question'].iloc[tr_idx])))[0]
+            f_tr = concat_features(f_tr, subset_features(syn, keep))
+            y_f_tr = np.concatenate([y_f_tr, syn_df['human_score'].values[keep]])
+            g_f_tr = np.concatenate([g_f_tr, split_groups(syn_df.iloc[keep], args.group_by)])
+
+        # Fresh GNN every fold: the saved weights were trained on rows that
+        # sit in this fold's validation set, so warm-starting from them leaks.
+        gnn_cv, sc_cv, _ = fit_gnn_and_scorer(f_tr, y_f_tr, g_f_tr, args.epochs,
+                                              seed=RANDOM_STATE + 100 * (fold_idx + 1))
+        _, _, y_f_va_pred, _ = predict(gnn_cv, sc_cv, f_va)
+
+        pc, _ = pearsonr(y_f_va, y_f_va_pred)
+        mae   = mean_absolute_error(y_f_va, y_f_va_pred)
+        f1    = f1_score((y_f_va >= PASS_THRESHOLD).astype(int),
+                         (y_f_va_pred >= PASS_THRESHOLD).astype(int), zero_division=0) * 100
+        cv_pearsons.append(pc); cv_maes.append(mae); cv_f1s.append(f1)
+        print(f'    Pearson={pc:.4f}  MAE={mae:.2f}  F1={f1:.1f}%\n')
+        saver.add_cv_fold(fold_idx + 1, pc, mae, f1)
+
+    print(f'\n{"="*75}')
+    print(f'  CV SUMMARY (mean ± std)')
+    print(f'{"="*75}')
+    print(f'  Pearson:  {np.mean(cv_pearsons):.4f} ± {np.std(cv_pearsons):.4f}')
+    print(f'  MAE:      {np.mean(cv_maes):.2f} ± {np.std(cv_maes):.2f}')
+    print(f'  F1:       {np.mean(cv_f1s):.1f}% ± {np.std(cv_f1s):.1f}%')
+    print(f'{"="*75}')
+    saver.add_cv_summary(cv_pearsons, cv_maes, cv_f1s)
 
 
 def main():
+    ensure_utf8_stdio()
     args = parse_args()
+    set_seed(RANDOM_STATE)
+
+    # ── Offline mode: use only cached HuggingFace models ────────────────────
+    if args.offline:
+        os.environ['HF_HUB_OFFLINE']       = '1'
+        os.environ['TRANSFORMERS_OFFLINE'] = '1'
+        print('[INFO] Offline mode — using locally cached models only.')
 
     # ── Results saver (starts log capture immediately) ────────────────────────
     saver = ResultsSaver(base_dir=args.output_results, label='evaluate')
     saver.start_log_capture()
 
     # ── Dataset ──────────────────────────────────────────────────────────────
-    # Derive augmented CSV path from the source filename so each dataset gets
-    # its own augmented file — prevents stale data being reused across datasets.
-    original_csv  = args.dataset or find_dataset_csv()
-    src_stem      = os.path.splitext(os.path.basename(original_csv))[0]
-    src_dir       = os.path.dirname(os.path.abspath(original_csv))
-    augmented_csv = os.path.join(src_dir, f'{src_stem}_augmented.csv')
-
-    if not os.path.exists(augmented_csv):
-        print(f'[INFO] Generating augmented dataset from: {original_csv}')
-        df_augmented = load_and_augment_dataset(original_csv, augmented_csv)
-    else:
-        df_augmented = pd.read_csv(augmented_csv)
-        print(f'[INFO] Loaded augmented dataset: {augmented_csv} ({len(df_augmented)} samples)')
-
-    train_df, test_df = split_dataset(df_augmented, num_adversarial=NUM_ADVERSARIAL,
-                                      test_size=TEST_SIZE, random_state=RANDOM_STATE)
-
-    # ── Auto-download: fetch missing model weights for this dataset from HF ────
-    _ensure_model_downloaded(src_stem, models_dir='models')
-
-    # ── NER pipeline ─────────────────────────────────────────────────────────
-    ner_pipe = None
-    try:
-        ner_pipe = hf_pipeline('ner', model='Davlan/bert-base-multilingual-cased-ner-hrl',
-                                aggregation_strategy='simple', device=-1)
-        print('[OK] NER pipeline loaded.')
-    except Exception as e:
-        print(f'[WARN] NER unavailable: {e}')
-
-    # ── Components ────────────────────────────────────────────────────────────
-    comps = _build_components()
-    tp, dp, cr, te, kgc, em, val = (
-        comps['text_processor'], comps['dep_parser'], comps['coref_resolver'],
-        comps['triple_extractor'], comps['kg_constructor'],
-        comps['embedder'], comps['validator'],
-    )
+    original_csv, src_stem, augmented_csv, df_augmented, train_df, test_df = \
+        load_split(args.dataset, args.group_by)
 
     # ── Dataset-specific model paths ─────────────────────────────────────────
-    feat_args = dict(text_processor=tp, dep_parser=dp, triple_extractor=te,
-                     kg_constructor=kgc, embedder=em, validator=val,
-                     coref_resolver=cr, ner_pipeline_obj=ner_pipe)
+    gnn_savepath    = args.gnn_model or os.path.join(args.models_dir, gnn_model_filename(src_stem))
+    scorer_savepath = args.scorer_model or os.path.join(args.models_dir, scorer_model_filename(src_stem))
+    if not (args.gnn_model or args.scorer_model):
+        _ensure_model_downloaded(src_stem, models_dir=args.models_dir)
 
-    ds_stem          = os.path.splitext(os.path.basename(original_csv))[0]
-    os.makedirs('models', exist_ok=True)
-    gnn_savepath     = os.path.join('models', f'nlp_dominator_gnn_{ds_stem}.pth')
-    scorer_savepath  = os.path.join('models', f'nlp_dominator_scorer_{ds_stem}.pkl')
+    # ── Components ────────────────────────────────────────────────────────────
+    comps = build_components()
 
-    # ── Load GNN (dataset-specific fine-tuned, fallback to base weights) ─────
-    gnn = SiameseGNN()
-    if os.path.exists(gnn_savepath):
+    # ── Load GNN + scorer (a scorer is only valid with the GNN it was fit on) ─
+    gnn, scorer, loaded = SiameseGNN(), AnswerScorer(), False
+    if os.path.exists(gnn_savepath) and os.path.exists(scorer_savepath):
         try:
-            gnn.load_state_dict(torch.load(gnn_savepath, map_location='cpu'))
-            print(f'[OK] GNN loaded from {gnn_savepath} (skipping fine-tuning)')
-            gnn_trained = True
-        except Exception as e:
-            print(f'[WARN] Could not load GNN ({e}). Will fine-tune.')
-            gnn_trained = False
-    elif os.path.exists(args.gnn_model):
-        gnn.load_state_dict(torch.load(args.gnn_model, map_location='cpu'))
-        print(f'[OK] Base GNN loaded from {args.gnn_model} — will fine-tune on this dataset.')
-        gnn_trained = False
-    else:
-        print(f'[WARN] No GNN weights found. Fine-tuning from scratch.')
-        gnn_trained = False
-
-    # ── Scorer: load if already trained for this dataset ─────────────────────
-    scorer        = AnswerScorer()
-    scorer_loaded = False
-    if os.path.exists(scorer_savepath):
-        try:
+            gnn.load_state_dict(torch.load(gnn_savepath, map_location='cpu', weights_only=True))
             scorer.load_model(scorer_savepath)
-            scorer_loaded = True
-            print(f'[OK] Scorer loaded from {scorer_savepath} (skipping retraining)')
+            loaded = True
+            print(f'[OK] Models loaded: {gnn_savepath}, {scorer_savepath}')
         except Exception as e:
-            print(f'[WARN] Could not load scorer ({e}). Will retrain.')
+            print(f'[WARN] Could not load models ({e}). Will train.')
+    else:
+        print(f'[WARN] No trained models at {gnn_savepath} / {scorer_savepath}. Will train.')
 
-    # ── Train split features (needed if GNN or scorer needs training) ─────────
-    if not gnn_trained or not scorer_loaded:
-        print('\nExtracting training features...')
-        (bsims_tr, rpyg_tr, spyg_tr, pen_tr, emm_tr, cov_tr, neg_tr, _) = \
-            create_graphs_and_features(train_df, **feat_args)
-        # Ensure numeric arrays (pipeline may return plain Python lists)
-        bsims_tr = np.array(bsims_tr, dtype=float)
-        pen_tr   = np.array(pen_tr,   dtype=float)
-        emm_tr   = np.array(emm_tr,   dtype=float)
-        cov_tr   = np.array(cov_tr,   dtype=float)
-        neg_tr   = np.array(neg_tr,   dtype=float)
-        y_train = train_df['human_score'].values.astype(float)
+    # ── Train split features (always needed: they calibrate the baselines) ───
+    print('\nExtracting training features...')
+    train_fit = with_synthetic(train_df, comps['dep_parser'])
+    tr        = create_graphs_and_features(train_fit, comps)
+    y_train   = train_fit['human_score'].values.astype(float)
 
-        # Fine-tune GNN on this dataset's train split
-        if not gnn_trained:
-            gnn = train_gnn(gnn, rpyg_tr, spyg_tr, y_train, epochs=GNN_EPOCHS)
-            torch.save(gnn.state_dict(), gnn_savepath)
-            print(f'[INFO] Fine-tuned GNN saved to {gnn_savepath}')
-
-        # Train scorer using fine-tuned GNN similarities
-        if not scorer_loaded:
-            print('\n[INFO] Training scorer on current dataset train split...')
-            gsims_tr = np.array(get_gnn_similarities(gnn, rpyg_tr, spyg_tr), dtype=float)
-            X_train  = np.column_stack((bsims_tr, gsims_tr, pen_tr, emm_tr, cov_tr, neg_tr))
-            scorer.train(X_train, y_train)
-            scorer.save_model(scorer_savepath)
-            print(f'[INFO] Scorer saved to {scorer_savepath}')
-
-
+    if loaded:
+        gsims_tr = get_gnn_similarities(gnn, tr['ref_pyg'], tr['stu_pyg'])
+    else:
+        gnn, scorer, gsims_tr = fit_gnn_and_scorer(
+            tr, y_train, split_groups(train_fit, args.group_by), args.epochs)
+        for path in (gnn_savepath, scorer_savepath):
+            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        torch.save(gnn.state_dict(), gnn_savepath)
+        scorer.save_model(scorer_savepath)
+        print(f'[INFO] Models saved to {gnn_savepath}, {scorer_savepath}')
 
     print('\nExtracting test features...')
-    (bsims_te, rpyg_te, spyg_te, pen_te, emm_te, cov_te, neg_te, rouge_te) = \
-        create_graphs_and_features(test_df, **feat_args)
-    # Ensure numeric arrays (pipeline may return plain Python lists)
-    bsims_te = np.array(bsims_te, dtype=float)
-    rouge_te = np.array(rouge_te, dtype=float)
-    pen_te   = np.array(pen_te,   dtype=float)
-    emm_te   = np.array(emm_te,   dtype=float)
-    cov_te   = np.array(cov_te,   dtype=float)
-    neg_te   = np.array(neg_te,   dtype=float)
+    te       = create_graphs_and_features(test_df, comps)
     y_test   = test_df['human_score'].values.astype(float)
-    gsims_te = np.array(get_gnn_similarities(gnn, rpyg_te, spyg_te), dtype=float)
-
-    wrong_num_te = compute_wrong_num_flags(pen_te, test_df, dp, tp, val)
-    X_test = np.column_stack((bsims_te, gsims_te, pen_te, emm_te, cov_te, neg_te))
-    y_pred_raw = scorer.predict_batch(X_test)
-    y_pred_proposed, override_log = apply_hard_overrides(y_pred_raw, neg_te, pen_te, wrong_num_te)
+    gsims_te, y_pred_raw, y_pred_proposed, override_log = predict(gnn, scorer, te)
 
     # ── BanglaBERT cosine similarity baseline ────────────────────────────────
     print('\n[INFO] Computing BanglaBERT cosine similarity baseline...')
-    bb_sims = []
-    for _, row in test_df.iterrows():
-        ref_emb = em.get_embedding(str(row['reference_answer'])).unsqueeze(0)
-        stu_emb = em.get_embedding(str(row['student_answer'])).unsqueeze(0)
-        bb_sims.append(torch.nn.functional.cosine_similarity(ref_emb, stu_emb).item())
-    bb_sims = np.array(bb_sims)
-    banglabert_pred = np.clip(bb_sims * 100, 0, 100)
+    em = comps['embedder']
+    bb_tr = np.array([em.banglabert_similarity(r, s) for r, s in
+                      zip(train_fit['reference_answer'].astype(str), train_fit['student_answer'].astype(str))])
+    bb_te = np.array([em.banglabert_similarity(r, s) for r, s in
+                      zip(test_df['reference_answer'].astype(str), test_df['student_answer'].astype(str))])
 
-
-    # ── Baselines (no training needed — use already-computed features) ─────────
-    labse_pred      = np.clip(bsims_te * 100, 0, 100)
-    rouge_pred      = np.clip(rouge_te  * 100, 0, 100)
-    avg_pred        = np.clip((bsims_te + rouge_te) / 2 * 100, 0, 100)
-    gnn_pred        = np.clip(gsims_te * 100, 0, 100)
-
-    all_metrics = [
-        compute_full_metrics(y_test, labse_pred,       'Baseline: LaBSE Cosine Sim'),
-        compute_full_metrics(y_test, rouge_pred,       'Baseline: ROUGE-L Only'),
-        compute_full_metrics(y_test, avg_pred,         'Baseline: LaBSE + ROUGE-L Avg'),
-        compute_full_metrics(y_test, banglabert_pred,  'Baseline: BanglaBERT Cosine Sim'),
-        compute_full_metrics(y_test, gnn_pred,         'Ablation: GNN Only'),
-        compute_full_metrics(y_test, y_pred_raw,       'Proposed: Full Ensemble (no override)'),
-        compute_full_metrics(y_test, y_pred_proposed,  'Proposed: Full + Overrides (ours)'),
+    # ── Baselines (each similarity calibrated on the train split) ───────────
+    # GNN-only uses in-sample similarities of a loaded GNN when no OOF values
+    # exist; it is a 1-D linear calibration, so the effect is small.
+    predictions = [
+        ('Baseline: LaBSE Cosine Sim',      calibrated([tr['base_sim']], y_train, [te['base_sim']])),
+        ('Baseline: ROUGE-L Only',          calibrated([tr['rouge_l']], y_train, [te['rouge_l']])),
+        ('Baseline: LaBSE + ROUGE-L',       calibrated([tr['base_sim'], tr['rouge_l']], y_train,
+                                                       [te['base_sim'], te['rouge_l']])),
+        ('Baseline: BanglaBERT Cosine Sim', calibrated([bb_tr], y_train, [bb_te])),
+        ('Ablation: GNN Only',              calibrated([gsims_tr], y_train, [gsims_te])),
+        ('Proposed: Full Ensemble (no override)', y_pred_raw),
+        ('Proposed: Full + Overrides (ours)',     y_pred_proposed),
     ]
-    print_regression_table(all_metrics)
+    phrases = template_phrases(normal_rows(df_augmented))
+    report(saver, predictions, y_test, test_df, phrases, proposed='Proposed: Full + Overrides (ours)')
 
     # ── Register test results with saver ──────────────────────────────────────
     saver.set_config({
-        'script':       'evaluate.py',
-        'dataset':      augmented_csv,
-        'gnn_model':    args.gnn_model,
-        'scorer_model': args.scorer_model,
-        'random_state': RANDOM_STATE,
-        'test_size':    TEST_SIZE,
+        'script':          'evaluate.py',
+        'dataset':         augmented_csv,
+        'gnn_model':       gnn_savepath,
+        'scorer_model':    scorer_savepath,
+        'models_loaded':   loaded,
+        'epochs':          args.epochs,
+        'random_state':    RANDOM_STATE,
+        'test_size':       TEST_SIZE,
         'num_adversarial': NUM_ADVERSARIAL,
-        'n_test':       len(test_df),
-        'skip_cv':      args.skip_cv,
+        'split_group_by':  args.group_by,
+        'n_test':          len(test_df),
+        'ensemble_weights': list(scorer.ensemble_weights),
+        'template_phrases': phrases,
+        'skip_cv':         args.skip_cv,
     })
-    saver.add_metrics(all_metrics)
     saver.add_predictions(test_df, y_test, y_pred_raw, y_pred_proposed, override_log)
     saver.add_feature_importances(scorer)
 
-    # ── 5-Fold Cross-Validation ───────────────────────────────────────────────
     if not args.skip_cv:
-        df_normal = df_augmented.iloc[:-NUM_ADVERSARIAL].copy().reset_index(drop=True)
-        kf = KFold(n_splits=CV_N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
-        print(f'\n{"="*75}')
-        print(f'  5-FOLD CROSS-VALIDATION (non-adversarial, proposed model)')
-        print(f'{"="*75}')
-        print(f'  CV pool size: {len(df_normal)} (adversarial excluded)\n')
+        _run_cv(df_augmented, comps, args, saver)
 
-        cv_pearsons, cv_maes, cv_f1s = [], [], []
-        for fold_idx, (tr_idx, val_idx) in enumerate(kf.split(df_normal)):
-            fold_tr = df_normal.iloc[tr_idx].copy().reset_index(drop=True)
-            fold_va = df_normal.iloc[val_idx].copy().reset_index(drop=True)
-            print(f'  Fold {fold_idx+1}/{CV_N_SPLITS} — train={len(fold_tr)}, val={len(fold_va)}')
-
-            (bsims_f_tr, rpyg_f_tr, spyg_f_tr, pen_f_tr, emm_f_tr, cov_f_tr, neg_f_tr, _) = \
-                create_graphs_and_features(fold_tr, **feat_args)
-            # Ensure numeric arrays — CV fold train
-            bsims_f_tr = np.array(bsims_f_tr, dtype=float)
-            pen_f_tr   = np.array(pen_f_tr,   dtype=float)
-            emm_f_tr   = np.array(emm_f_tr,   dtype=float)
-            cov_f_tr   = np.array(cov_f_tr,   dtype=float)
-            neg_f_tr   = np.array(neg_f_tr,   dtype=float)
-
-            (bsims_f_va, rpyg_f_va, spyg_f_va, pen_f_va, emm_f_va, cov_f_va, neg_f_va, _) = \
-                create_graphs_and_features(fold_va, **feat_args)
-            # Ensure numeric arrays — CV fold val
-            bsims_f_va = np.array(bsims_f_va, dtype=float)
-            pen_f_va   = np.array(pen_f_va,   dtype=float)
-            emm_f_va   = np.array(emm_f_va,   dtype=float)
-            cov_f_va   = np.array(cov_f_va,   dtype=float)
-            neg_f_va   = np.array(neg_f_va,   dtype=float)
-
-            y_f_tr = fold_tr['human_score'].values.astype(float)
-            y_f_va = fold_va['human_score'].values.astype(float)
-
-            # Start from the dataset-specific fine-tuned weights (not random)
-            gnn_cv = SiameseGNN()
-            if os.path.exists(gnn_savepath):
-                gnn_cv.load_state_dict(torch.load(gnn_savepath, map_location='cpu'))
-            gnn_cv = train_gnn(gnn_cv, rpyg_f_tr, spyg_f_tr, y_f_tr, epochs=GNN_EPOCHS)
-            gsims_f_tr = np.array(get_gnn_similarities(gnn_cv, rpyg_f_tr, spyg_f_tr), dtype=float)
-            gsims_f_va = np.array(get_gnn_similarities(gnn_cv, rpyg_f_va, spyg_f_va), dtype=float)
-
-            sc_cv = AnswerScorer()
-            X_f_tr = np.column_stack((bsims_f_tr, gsims_f_tr, pen_f_tr, emm_f_tr, cov_f_tr, neg_f_tr))
-            sc_cv.train(X_f_tr, y_f_tr)
-
-            X_f_va = np.column_stack((bsims_f_va, gsims_f_va, pen_f_va, emm_f_va, cov_f_va, neg_f_va))
-            y_f_va_pred = sc_cv.predict_batch(X_f_va)
-
-            wn_va = compute_wrong_num_flags(pen_f_va, fold_va, dp, tp, val)
-            y_f_va_pred, _ = apply_hard_overrides(y_f_va_pred, neg_f_va, pen_f_va, wn_va)
-
-            pc, _ = pearsonr(y_f_va, y_f_va_pred)
-            mae   = mean_absolute_error(y_f_va, y_f_va_pred)
-            f1    = f1_score((y_f_va >= 50).astype(int),
-                             (y_f_va_pred >= 50).astype(int), zero_division=0) * 100
-            cv_pearsons.append(pc); cv_maes.append(mae); cv_f1s.append(f1)
-            print(f'    Pearson={pc:.4f}  MAE={mae:.2f}  F1={f1:.1f}%\n')
-            saver.add_cv_fold(fold_idx + 1, pc, mae, f1)
-
-        print(f'\n{"="*75}')
-        print(f'  CV SUMMARY (mean ± std)')
-        print(f'{"="*75}')
-        print(f'  Pearson:  {np.mean(cv_pearsons):.4f} ± {np.std(cv_pearsons):.4f}')
-        print(f'  MAE:      {np.mean(cv_maes):.2f} ± {np.std(cv_maes):.2f}')
-        print(f'  F1:       {np.mean(cv_f1s):.1f}% ± {np.std(cv_f1s):.1f}%')
-        print(f'{"="*75}')
-        saver.add_cv_summary(cv_pearsons, cv_maes, cv_f1s)
-
-    saver.save_all()
+    saver.save_all(num_adversarial=NUM_ADVERSARIAL)
 
 
 if __name__ == '__main__':

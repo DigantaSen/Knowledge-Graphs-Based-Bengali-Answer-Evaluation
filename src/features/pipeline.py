@@ -2,16 +2,32 @@
 pipeline.py
 ===========
 Main feature extraction pipeline, GNN training, and GNN inference.
+
+``extract_pair_features`` is the single definition of the scorer's inputs;
+training, evaluation and the demo all call it so their features agree.
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from sklearn.model_selection import GroupKFold
+from torch_geometric.data import Batch
 from tqdm.auto import tqdm
 
-from src.models.siamese_gnn import nx_to_pyg_data
-from src.utils.helpers import negation_mismatch, compute_rouge_l, sentence_coverage_score
+from src.config import GNN_BATCH_SIZE, RANDOM_STATE, SYNONYM_THRESHOLD
+from src.features.answer_slot import answer_slot_features
+from src.models.siamese_gnn import SiameseGNN, nx_to_pyg_data
+from src.utils.helpers import (
+    compute_rouge_l, is_bengali_numeral, is_multi_sentence, negation_mismatch,
+    sentence_coverage_score, set_seed, wrong_number,
+)
+
+# Order of the scorer's base features (see AnswerScorer.FEATURE_NAMES)
+SCORER_FEATURES = ('base_sim', 'graph_sim', 'penalty', 'entity_mm', 'coverage', 'neg_mm', 'wrong_num',
+                   'ans_recall', 'ans_precision', 'key_match')
+_SCALAR_FEATURES = ('base_sim', 'penalty', 'entity_mm', 'coverage', 'neg_mm', 'wrong_num',
+                    'ans_recall', 'ans_precision', 'key_match', 'rouge_l')
 
 
 def compute_entity_mismatch(ref_parsed, stu_parsed, ref_text: str, stu_text: str,
@@ -20,7 +36,8 @@ def compute_entity_mismatch(ref_parsed, stu_parsed, ref_text: str, stu_text: str
     Compute a numeric entity mismatch score in [0, 1].
 
     Combines NER-detected entities and dependency-parsed content words.
-    Uses embedding cosine similarity to allow synonym matching.
+    A missing reference word counts as present when the student added a
+    word with LaBSE similarity >= SYNONYM_THRESHOLD; numbers must match exactly.
     """
     ref_word_set = set(ref_text.replace('।', '').replace(',', '').split())
     stu_word_set = set(stu_text.replace('।', '').replace(',', '').split())
@@ -57,12 +74,13 @@ def compute_entity_mismatch(ref_parsed, stu_parsed, ref_text: str, stu_text: str
 
     missing = ref_content - stu_content
     added   = stu_content - ref_content
-    SYNONYM_THRESHOLD = 0.75
     truly_missing = set()
     for ref_word in missing:
         found = False
-        if embedder_obj is not None and added:
+        if embedder_obj is not None and added and not is_bengali_numeral(ref_word):
             for stu_word in added:
+                if is_bengali_numeral(stu_word):
+                    continue
                 try:
                     if embedder_obj.word_cosine_similarity(ref_word, stu_word) >= SYNONYM_THRESHOLD:
                         found = True
@@ -77,100 +95,175 @@ def compute_entity_mismatch(ref_parsed, stu_parsed, ref_text: str, stu_text: str
     return min(1.0, missing_ratio + substitution_penalty)
 
 
-def create_graphs_and_features(df, text_processor, dep_parser, triple_extractor,
-                                kg_constructor, embedder, validator,
-                                coref_resolver=None, ner_pipeline_obj=None):
+def extract_pair_features(question: str, ref_text: str, stu_text: str, comps: dict) -> dict:
+    """
+    Compute every feature for one (question, reference, student) triple.
+
+    *comps* holds the NLP components: text_processor, dep_parser,
+    triple_extractor, kg_constructor, embedder, validator, and optionally
+    coref_resolver and ner.
+
+    Returns a dict with the scalar features in SCORER_FEATURES (except
+    graph_sim, which needs a trained GNN), plus rouge_l, multi_sentence,
+    karak_explanations, the PyG graphs (ref_pyg, stu_pyg) and the NetworkX
+    graphs (ref_kg, stu_kg).
+    """
+    tp, dp = comps['text_processor'], comps['dep_parser']
+    te, kgc = comps['triple_extractor'], comps['kg_constructor']
+    emb, val = comps['embedder'], comps['validator']
+    cr, ner = comps.get('coref_resolver'), comps.get('ner')
+
+    # Both sides are resolved so a verbatim copy stays a verbatim copy
+    if cr:
+        ref_res = cr.resolve(ref_text, question, '')
+        stu_res = cr.resolve(stu_text, question, ref_text)
+    else:
+        ref_res, stu_res = ref_text, stu_text
+
+    ref_parsed = dp.parse(tp.normalize(ref_res))
+    stu_parsed = dp.parse(tp.normalize(stu_res))
+    ref_kg = kgc.build_graph(te.extract_triples(raw_text=ref_res))
+    stu_kg = kgc.build_graph(te.extract_triples(raw_text=stu_res))
+    penalty, explanations = val.validate(ref_parsed, stu_parsed, ref_raw=ref_res, stu_raw=stu_res)
+
+    return {
+        # Answer-slot features: compare only the content that answers the question
+        **answer_slot_features(question, ref_res, stu_res, comps),
+        'base_sim':  emb.cosine_similarity(ref_res, stu_res),
+        'penalty':   penalty,
+        'entity_mm': compute_entity_mismatch(ref_parsed, stu_parsed, ref_res, stu_res,
+                                             embedder_obj=emb, ner_pipeline_obj=ner),
+        'coverage':  sentence_coverage_score(ref_res, stu_res, emb),
+        'neg_mm':    float(negation_mismatch(ref_res, stu_res)),
+        'wrong_num': float(wrong_number(ref_res, stu_res)),
+        'rouge_l':   compute_rouge_l(ref_res, stu_res),
+        'multi_sentence': is_multi_sentence(ref_text),
+        'karak_explanations': explanations,
+        'ref_kg': ref_kg, 'stu_kg': stu_kg,
+        'ref_pyg': nx_to_pyg_data(ref_kg, emb.generate_node_embeddings(ref_kg)),
+        'stu_pyg': nx_to_pyg_data(stu_kg, emb.generate_node_embeddings(stu_kg)),
+    }
+
+
+def create_graphs_and_features(df, comps: dict) -> dict:
     """
     Extract all features for every row in *df*.
 
     Returns
     -------
-    (baseline_sims, pyg_ref_data, pyg_stu_data,
-     karak_penalties, entity_mismatches,
-     coverage_scores, negation_flags, rouge_l_scores)
+    dict of per-row values: float arrays for the scalar features
+    ('base_sim', 'penalty', 'entity_mm', 'coverage', 'neg_mm', 'wrong_num',
+    'ans_recall', 'ans_precision', 'key_match', 'rouge_l'), a bool array
+    'multi_sentence', and lists 'ref_pyg' /
+    'stu_pyg' of PyG graphs.
     """
     print(f'Processing {len(df)} samples...')
-    baseline_sims, pyg_ref_data, pyg_stu_data = [], [], []
-    karak_penalties, entity_mismatches         = [], []
-    coverage_scores, negation_flags, rouge_l_scores = [], [], []
-
+    rows = []
     for _, row in tqdm(df.iterrows(), total=len(df), desc='Feature extraction'):
-        ref_text = str(row['reference_answer'])
-        stu_text = str(row['student_answer'])
-        q_text   = str(row.get('question', ''))
-        stu_resolved = (coref_resolver.resolve(stu_text, q_text, ref_text)
-                        if coref_resolver else stu_text)
-
-        baseline_sims.append(embedder.cosine_similarity(ref_text, stu_resolved))
-
-        ref_parsed = dep_parser.parse(text_processor.normalize(ref_text))
-        stu_parsed = dep_parser.parse(text_processor.normalize(stu_resolved))
-        ref_triples = triple_extractor.extract_triples(raw_text=ref_text)
-        stu_triples = triple_extractor.extract_triples(raw_text=stu_resolved)
-        ref_kg  = kg_constructor.build_graph(ref_triples)
-        stu_kg  = kg_constructor.build_graph(stu_triples)
-        ref_emb = embedder.generate_node_embeddings(ref_kg)
-        stu_emb = embedder.generate_node_embeddings(stu_kg)
-        pyg_ref_data.append(nx_to_pyg_data(ref_kg, ref_emb))
-        pyg_stu_data.append(nx_to_pyg_data(stu_kg, stu_emb))
-
-        penalty, _ = validator.validate(ref_parsed, stu_parsed,
-                                        ref_raw=ref_text, stu_raw=stu_resolved)
-        karak_penalties.append(penalty)
-        entity_mismatches.append(compute_entity_mismatch(
-            ref_parsed, stu_parsed, ref_text, stu_resolved,
-            embedder_obj=embedder, ner_pipeline_obj=ner_pipeline_obj))
-        coverage_scores.append(sentence_coverage_score(ref_text, stu_resolved, embedder))
-        negation_flags.append(negation_mismatch(ref_text, stu_resolved))
-        rouge_l_scores.append(compute_rouge_l(ref_text, stu_resolved))
-
+        f = extract_pair_features(str(row.get('question', '')), str(row['reference_answer']),
+                                  str(row['student_answer']), comps)
+        rows.append(f)
     print('Feature extraction complete.')
-    return (baseline_sims, pyg_ref_data, pyg_stu_data,
-            karak_penalties, entity_mismatches,
-            coverage_scores, negation_flags, rouge_l_scores)
+    out = {k: np.array([r[k] for r in rows], dtype=float) for k in _SCALAR_FEATURES}
+    out['multi_sentence'] = np.array([r['multi_sentence'] for r in rows], dtype=bool)
+    out['ref_pyg'] = [r['ref_pyg'] for r in rows]
+    out['stu_pyg'] = [r['stu_pyg'] for r in rows]
+    return out
 
 
-def train_gnn(gnn_model, pyg_ref_data, pyg_stu_data, target_scores, epochs: int = 20):
+def subset_features(feats: dict, idx) -> dict:
+    """Select rows *idx* from every feature (lists of PyG graphs and arrays)."""
+    return {k: ([v[i] for i in idx] if isinstance(v, list) else v[idx]) for k, v in feats.items()}
+
+
+def concat_features(a: dict, b: dict) -> dict:
+    return {k: (a[k] + b[k] if isinstance(a[k], list) else np.concatenate([a[k], b[k]]))
+            for k in a}
+
+
+def scorer_matrix(feats: dict, gsims) -> np.ndarray:
+    """Stack the scorer's base features in SCORER_FEATURES order."""
+    cols = {**feats, 'graph_sim': np.asarray(gsims, dtype=float)}
+    return np.column_stack([cols[k] for k in SCORER_FEATURES])
+
+
+def _batches(n: int, batch_size: int, rng=None):
+    order = rng.permutation(n) if rng is not None else np.arange(n)
+    for s in range(0, n, batch_size):
+        yield order[s:s + batch_size]
+
+
+def train_gnn(gnn_model, pyg_ref_data, pyg_stu_data, target_scores, epochs: int = 20,
+              seed: int = RANDOM_STATE, batch_size: int = GNN_BATCH_SIZE):
     """
     Train *gnn_model* on (ref_graph, stu_graph) pairs supervised by *target_scores*.
 
-    Parameters
-    ----------
-    gnn_model : SiameseGNN
-    pyg_ref_data, pyg_stu_data : lists of PyG Data objects
-    target_scores : array-like of float scores in [0, 100]
-    epochs : int
+    Mini-batches are reshuffled every epoch from a seeded RNG, so a run is
+    reproducible.
 
     Returns
     -------
     trained gnn_model
     """
     print(f'\nTraining GAT-GNN for {epochs} epochs...')
+    set_seed(seed)
+    rng = np.random.default_rng(seed)
     optimizer = optim.Adam(gnn_model.parameters(), lr=0.005, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     criterion = nn.MSELoss()
+    targets = torch.tensor(np.asarray(target_scores, dtype=float) / 100.0, dtype=torch.float32)
     gnn_model.train()
 
     for ep in range(epochs):
         total_loss = 0.0
-        for ref_g, stu_g, score in zip(pyg_ref_data, pyg_stu_data, target_scores):
+        for idx in _batches(len(targets), batch_size, rng):
             optimizer.zero_grad()
-            pred_sim   = gnn_model(ref_g, stu_g)
-            target_sim = torch.tensor([score / 100.0], dtype=torch.float32)
-            loss = criterion(pred_sim, target_sim)
+            ref_b = Batch.from_data_list([pyg_ref_data[i] for i in idx])
+            stu_b = Batch.from_data_list([pyg_stu_data[i] for i in idx])
+            loss = criterion(gnn_model(ref_b, stu_b), targets[idx])
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
+            total_loss += loss.item() * len(idx)
         scheduler.step()
-        avg_loss = total_loss / max(len(target_scores), 1)
+        avg_loss = total_loss / max(len(targets), 1)
         lr = scheduler.get_last_lr()[0]
         print(f'  Epoch {ep+1}/{epochs} - Loss: {avg_loss:.4f} - LR: {lr:.6f}')
 
     return gnn_model
 
 
-def get_gnn_similarities(gnn_model, pyg_ref_data, pyg_stu_data) -> list:
-    """Return cosine similarities for all (ref, stu) graph pairs."""
+def get_gnn_similarities(gnn_model, pyg_ref_data, pyg_stu_data,
+                         batch_size: int = GNN_BATCH_SIZE) -> np.ndarray:
+    """Return cosine similarities (clipped at 0) for all (ref, stu) graph pairs."""
     gnn_model.eval()
+    out = []
     with torch.no_grad():
-        return [max(0.0, gnn_model(r, s).item()) for r, s in zip(pyg_ref_data, pyg_stu_data)]
+        for idx in _batches(len(pyg_ref_data), batch_size):
+            ref_b = Batch.from_data_list([pyg_ref_data[i] for i in idx])
+            stu_b = Batch.from_data_list([pyg_stu_data[i] for i in idx])
+            out.append(gnn_model(ref_b, stu_b).clamp(min=0.0).numpy())
+    return np.concatenate(out) if out else np.zeros(0)
+
+
+def get_oof_gnn_similarities(pyg_ref_data, pyg_stu_data, target_scores, groups,
+                             n_splits: int = 5, epochs: int = 20,
+                             seed: int = RANDOM_STATE) -> np.ndarray:
+    """
+    Out-of-fold GNN similarities for training rows.
+
+    The ensemble scorer must be trained on graph_sim values from a GNN that
+    did not see those rows.  In-sample similarities are optimistic, so the
+    scorer learns to over-trust graph_sim and then meets a different
+    distribution at test time.  *groups* keeps duplicated rows in one fold.
+    """
+    target_scores = np.asarray(target_scores, dtype=float)
+    oof = np.zeros(len(target_scores))
+    folds = GroupKFold(n_splits=n_splits).split(oof, groups=groups)
+    for fold, (tr_idx, va_idx) in enumerate(folds):
+        print(f'\n  [OOF {fold+1}/{n_splits}] GNN on {len(tr_idx)} rows -> predict {len(va_idx)}')
+        gnn = train_gnn(SiameseGNN(),
+                        [pyg_ref_data[i] for i in tr_idx], [pyg_stu_data[i] for i in tr_idx],
+                        target_scores[tr_idx], epochs=epochs, seed=seed + fold + 1)
+        oof[va_idx] = get_gnn_similarities(gnn, [pyg_ref_data[i] for i in va_idx],
+                                           [pyg_stu_data[i] for i in va_idx])
+    return oof

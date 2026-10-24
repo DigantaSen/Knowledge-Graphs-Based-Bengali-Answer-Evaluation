@@ -3,83 +3,68 @@ kg_constructor.py
 =================
 Knowledge Graph construction from typed triples using NetworkX.
 
-Improvements over the original:
-  - Accepts 4-tuple triples: (subject, relation, object, triple_type).
-  - Assigns node types based on triple_type ('entity', 'number', 'time',
-    'location', 'quality') so the GNN can distinguish entity categories.
-  - Assigns edge weights based on triple_type (content-carrying triples
-    get weight 1.0; attribute triples get 0.6).
-  - Still backward-compatible with plain 3-tuple triples from old callers.
+  - Accepts (head_id, relation, tail_id, triple_type) triples from
+    TripleExtractor; predicate nodes ('PRED::<text>::<n>') become 'predicate'
+    nodes, argument nodes are typed by the relation that points at them.
+  - Each node stores its display / embedding text ('label'), its 'node_type'
+    and whether it is 'negated' (predicates such as 'ওঠে না').
+  - Each edge stores its 'triple_type' and a 'weight' (core agent/object
+    edges 1.0, attribute edges lower).
+  - NODE_TYPES / EDGE_TYPES define the one-hot features the GNN receives.
 """
 
 import networkx as nx
 
+from src.nlp.triple_extractor import PRED_PREFIX, node_label
+from src.utils.helpers import has_negation
 
-# Mapping from triple_type → (node category for object node, edge weight)
+NODE_TYPES = ('entity', 'predicate', 'number', 'time', 'location', 'quality')
+EDGE_TYPES = ('agent', 'object', 'location', 'time', 'count', 'quality', 'possessive')
+
+# triple_type → (node type of the tail, edge weight)
 _TYPE_META = {
-    'main':       ('entity',   1.0),
-    'count':      ('number',   0.8),
-    'quality':    ('quality',  0.7),
-    'time':       ('time',     0.8),
-    'location':   ('location', 0.8),
-    'source':     ('location', 0.7),
-    'instrument': ('entity',   0.6),
-    'purpose':    ('entity',   0.6),
-    'companion':  ('entity',   0.7),
-    'possessive': ('entity',   0.7),
+    'agent':      ('predicate', 1.0),
+    'object':     ('entity',    1.0),
+    'location':   ('location',  0.8),
+    'time':       ('time',      0.8),
+    'count':      ('number',    0.8),
+    'quality':    ('quality',   0.6),
+    'possessive': ('entity',    0.7),
 }
 
 
 class KnowledgeGraphConstructor:
-    """Build a typed, weighted directed NetworkX graph from triples.
-
-    Accepts either:
-    * 4-tuples: (subject, relation, object, triple_type)   ← preferred
-    * 3-tuples: (subject, relation, object)                ← legacy, treated as 'main'
-    """
+    """Build a typed, weighted directed NetworkX graph from triples."""
 
     def __init__(self):
         pass
 
+    @staticmethod
+    def _add_node(G, node_id: str, node_type: str):
+        if node_id in G:
+            return
+        label = node_label(node_id)
+        is_pred = node_id.startswith(PRED_PREFIX)
+        G.add_node(node_id, label=label,
+                   node_type='predicate' if is_pred else node_type,
+                   negated=is_pred and has_negation(label))
+
     def build_graph(self, triples: list) -> nx.DiGraph:
         """
-        Construct a typed DiGraph from a list of triples.
-
-        Parameters
-        ----------
-        triples : list of 3- or 4-tuples
+        Construct a typed DiGraph from a list of 4-tuples
+        (head_id, relation, tail_id, triple_type).
 
         Returns
         -------
-        nx.DiGraph  with node attribute 'node_type' and edge attributes
-                    'relation' (str) and 'weight' (float).
+        nx.DiGraph with node attributes 'label', 'node_type', 'negated' and
+        edge attributes 'relation', 'triple_type', 'weight'.
         """
         G = nx.DiGraph()
-
-        for triple in triples:
-            # ── Unpack — handle both 3-tuple and 4-tuple ──────────────────
-            if len(triple) == 4:
-                subj, rel, obj, ttype = triple
-            else:
-                subj, rel, obj = triple[:3]
-                ttype = 'main'
-
-            obj_node_type, edge_weight = _TYPE_META.get(ttype, ('entity', 0.5))
-
-            # ── Subject node ───────────────────────────────────────────────
-            if subj not in G:
-                G.add_node(subj, node_type='entity')
-
-            # ── Object node ────────────────────────────────────────────────
-            if obj and obj != '[NONE]':
-                if obj not in G:
-                    G.add_node(obj, node_type=obj_node_type)
-                G.add_edge(subj, obj, relation=rel, weight=edge_weight,
-                           triple_type=ttype)
-            else:
-                # '[NONE]' objects: still record a self-loop so the subject
-                # node participates in the graph and gets an embedding.
-                G.add_node(subj, node_type='entity')
-                # Skip adding a meaningless [NONE] node/edge.
-
+        for head, rel, tail, ttype in triples:
+            self._add_node(G, head, 'entity')
+            if ttype == 'none' or not tail:
+                continue
+            tail_type, weight = _TYPE_META.get(ttype, ('entity', 0.5))
+            self._add_node(G, tail, tail_type)
+            G.add_edge(head, tail, relation=rel, weight=weight, triple_type=ttype)
         return G

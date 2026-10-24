@@ -4,38 +4,44 @@ karak_validator.py
 Semantic-role (karak) validation for Bengali answer scoring.
 """
 
-from src.utils.helpers import is_bengali_numeral, normalize_digits
+from src.utils.helpers import (
+    NEGATION_WORDS, align_token_sets, extract_numbers, has_negation as _has_negation,
+    is_bengali_numeral, negation_mismatch,
+)
+
+_ROLE_KEYS = ('agent', 'object', 'marked_object', 'location_time', 'numeric', 'modifier')
 
 
 class KarakValidator:
     """
     Validate student answers by checking semantic role alignment.
 
-    Roles checked: agent, object, location/time, instrument, numeric, modifier.
+    Roles checked: agent, object, location/time, numeric, modifier.
     Applies role-swap penalty, missing-location penalty, numeric mismatch penalty,
     and negation mismatch hard penalty.
     """
 
-    NEGATIONS = {'না', 'নয়', 'নি', 'নে', 'নেই', 'নাই', 'না-ই'}
+    NEGATIONS = NEGATION_WORDS
 
     def __init__(self):
         pass
 
     def has_negation(self, text: str) -> bool:
-        return any(neg in text.split() for neg in self.NEGATIONS)
+        return _has_negation(text)
 
     def extract_roles(self, parsed_sentence: list) -> dict:
         """
         Extract semantic roles from a single parsed sentence (list of token dicts).
 
+        ``marked_object`` holds only explicit objects — '-কে'-marked nominals and
+        passive subjects — which are the reliable evidence for a role swap.
+        ``object`` also includes unmarked nominals after the subject.
+
         Returns
         -------
-        dict with keys: agent, object, location_time, instrument, numeric, modifier
+        dict with keys: agent, object, marked_object, location_time, numeric, modifier
         """
-        roles = {
-            'agent': set(), 'object': set(), 'location_time': set(),
-            'instrument': set(), 'numeric': set(), 'modifier': set(),
-        }
+        roles = {k: set() for k in _ROLE_KEYS}
         for word in parsed_sentence:
             deprel = word['deprel']
             # Skip punctuation tokens added by the updated parser
@@ -44,37 +50,57 @@ class KarakValidator:
             lemma  = word.get('lemma') or word['text']
             raw    = word['text']
             if is_bengali_numeral(raw) or deprel == 'nummod':
-                roles['numeric'].add(normalize_digits(raw))
-            elif 'subj' in deprel:
+                roles['numeric'] |= extract_numbers(raw) or {raw}
+            elif deprel in ('nsubj', 'obl:agent'):
                 roles['agent'].add(lemma)
-            elif 'obj' in deprel:
+            elif deprel in ('obj', 'nsubj:pass'):
                 roles['object'].add(lemma)
-            elif deprel in ('obl:loc', 'obl:tmod'):
+                roles['marked_object'].add(lemma)
+            elif deprel == 'obj:bare':
+                roles['object'].add(lemma)
+            elif deprel == 'obl:loc':
                 roles['location_time'].add(lemma)
-            elif deprel in ('obl:ins', 'obl'):
-                roles['instrument'].add(lemma)
             elif deprel in ('amod', 'nmod', 'nmod:poss'):
                 roles['modifier'].add(lemma)
         return roles
 
     # ─── Internal helpers ─────────────────────────────────────────────────────
 
+    @staticmethod
+    def _surface_words(parsed_sentence: list) -> set:
+        return {w['text'] for w in parsed_sentence if w['deprel'] != 'punct'}
+
+    @staticmethod
+    def _lemmas(parsed_sentence: list) -> set:
+        return {w.get('lemma') or w['text'] for w in parsed_sentence if w['deprel'] != 'punct'}
+
     def _swap_penalty(self, ref_roles: dict, stu_roles: dict):
+        """
+        Role swap within one aligned sentence pair.  An entity only counts as
+        moved into the object role when the student marks it explicitly
+        ('-কে' or passive subject); unmarked nominals after the subject are
+        too ambiguous (a template prefix shifts every one of them).
+        """
         penalty = 0.0
         explanations = []
-        ref_all = ref_roles['agent'] | ref_roles['object']
-        stu_all = stu_roles['agent'] | stu_roles['object']
-        if ref_all == stu_all:
-            return 0.0, []
         for agent in ref_roles['agent']:
-            if agent in stu_roles['object'] and agent not in stu_roles['agent']:
+            if agent in stu_roles['marked_object'] and agent not in stu_roles['agent']:
                 penalty += 0.5
                 explanations.append(f"Role swap: '{agent}' was AGENT, now OBJECT.")
+        subject_changed = not (ref_roles['agent'] & stu_roles['agent'])
         for obj in ref_roles['object']:
-            if obj in stu_roles['agent'] and obj not in stu_roles['object']:
+            if (subject_changed and obj in stu_roles['agent']
+                    and obj not in stu_roles['object']):
                 penalty += 0.5
                 explanations.append(f"Role swap: '{obj}' was OBJECT, now AGENT.")
         return min(penalty, 1.0), explanations
+
+    def _merge_roles(self, parsed: list) -> dict:
+        merged = {k: set() for k in _ROLE_KEYS}
+        for sent in parsed:
+            for k, v in self.extract_roles(sent).items():
+                merged[k] |= v
+        return merged
 
     # ─── Public API ───────────────────────────────────────────────────────────
 
@@ -92,18 +118,30 @@ class KarakValidator:
         -------
         (penalty: float, explanations: list of str)
         """
-        blank = {'agent': set(), 'object': set(), 'location_time': set(),
-                 'instrument': set(), 'numeric': set(), 'modifier': set()}
-        ref_roles = {k: set() for k in blank}
-        stu_roles = {k: set() for k in blank}
-        for sent in ref_parsed:
-            for k, v in self.extract_roles(sent).items():
-                ref_roles[k].update(v)
-        for sent in stu_parsed:
-            for k, v in self.extract_roles(sent).items():
-                stu_roles[k].update(v)
+        ref_sents = [s for s in ref_parsed if s]
+        stu_sents = [s for s in stu_parsed if s]
 
-        penalty, explanations = self._swap_penalty(ref_roles, stu_roles)
+        # Role swaps are judged per aligned sentence pair: pooling roles over a
+        # whole paragraph mixes up subjects of different sentences.
+        penalty, explanations = 0.0, []
+        pairs = align_token_sets([self._lemmas(s) for s in ref_sents],
+                                 [self._lemmas(s) for s in stu_sents])
+        for i, j in pairs:
+            # The same inflected words in another order is a legal Bengali
+            # reordering (SOV <-> OSV), not a role swap.  This must compare
+            # surface forms: the role sets hold case-stripped lemmas, which are
+            # identical in a genuine swap ('রাম রাবণকে' vs 'রাবণ রামকে').
+            if self._surface_words(ref_sents[i]) == self._surface_words(stu_sents[j]):
+                continue
+            p, e = self._swap_penalty(self.extract_roles(ref_sents[i]),
+                                      self.extract_roles(stu_sents[j]))
+            penalty += p
+            explanations += e
+        penalty = min(penalty, 1.0)
+
+        # Content omissions are judged over the whole answer
+        ref_roles = self._merge_roles(ref_sents)
+        stu_roles = self._merge_roles(stu_sents)
 
         missing_loc = ref_roles['location_time'] - stu_roles['location_time']
         if missing_loc:
@@ -123,9 +161,8 @@ class KarakValidator:
         if missing_mod:
             penalty += 0.05 * len(missing_mod)
 
-        if ref_raw and stu_raw:
-            if self.has_negation(ref_raw) != self.has_negation(stu_raw):
-                penalty += 0.6
-                explanations.append('Negation mismatch detected (hard penalty).')
+        if ref_raw and stu_raw and negation_mismatch(ref_raw, stu_raw):
+            penalty += 0.6
+            explanations.append('Negation mismatch detected (hard penalty).')
 
         return min(penalty, 1.0), explanations

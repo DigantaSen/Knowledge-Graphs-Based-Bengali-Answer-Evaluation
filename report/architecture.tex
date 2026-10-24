@@ -1,0 +1,20 @@
+% System architecture (TikZ) — included by report.tex
+\begin{tikzpicture}[
+  font=\footnotesize, node distance=3.2mm and 2.6mm,
+  box/.style={draw, rounded corners=1.5pt, align=center, minimum height=6.6mm, inner sep=2pt, fill=#1},
+  box/.default=white,
+  arr/.style={-{Latex[length=1.6mm]}, semithick}]
+\node[box=gray!12, text width=3.1cm] (in) {Question, reference, student answer};
+\node[box, below=of in, text width=3.1cm] (pre) {Indic normalisation +\ coreference (both answers)};
+\node[box=blue!8, below left=4mm and -4mm of pre, text width=2.25cm] (sem) {LaBSE sentence\ similarity, coverage};
+\node[box=green!8, below=4mm of pre, text width=2.15cm] (kg) {Predicate-centred\ triples $\rightarrow$ KG};
+\node[box=orange!10, below right=4mm and -4mm of pre, text width=2.25cm] (rule) {Karak roles, negation,\ numbers, answer slot};
+\node[box=green!8, below=of kg, text width=2.15cm] (gnn) {Siamese GAT\ (LaBSE nodes)};
+\node[box=gray!12, below=5mm of gnn, text width=6.9cm] (sc) {XGBoost + MLP ensemble scorer (10 features)};
+\node[box, below=of sc, text width=6.9cm] (ov) {Hard caps (single-sentence references only) $\rightarrow$ score 0--100};
+\draw[arr] (in) -- (pre);
+\draw[arr] (pre) -- (sem); \draw[arr] (pre) -- (kg); \draw[arr] (pre) -- (rule);
+\draw[arr] (kg) -- (gnn);
+\draw[arr] (sem.south) -- (sem.south |- sc.north); \draw[arr] (gnn) -- (sc); \draw[arr] (rule.south) -- (rule.south |- sc.north);
+\draw[arr] (sc) -- (ov);
+\end{tikzpicture}

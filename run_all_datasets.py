@@ -10,13 +10,12 @@ Usage
     python run_all_datasets.py
     python run_all_datasets.py --epochs 10 --skip-cv
     python run_all_datasets.py --datasets data/dataset_single_sentence.csv data/dataset_medium_sentences.csv
+    python run_all_datasets.py --group-by question   # unseen-question setting
 
 Output
 ------
     models/
-        single/    <- GNN + scorer for single-sentence
-        medium/    <- GNN + scorer for medium-sentences
-        long/      <- GNN + scorer for long-sentences
+        nlp_dominator_{gnn,scorer}_<dataset_stem>.{pth,pkl}   <- one pair per dataset
 
     results/
         single/    <- metrics, predictions, figures for single-sentence
@@ -24,6 +23,9 @@ Output
         long/      <- ...
 
     results/comparison_all_datasets.csv   <- side-by-side summary
+
+    With --group-by question, models go to models/question_split/ and results
+    to results/<name>_question/ so the default (pair-split) models are kept.
 """
 
 import argparse
@@ -34,6 +36,8 @@ import time
 
 import pandas as pd
 
+from src.utils.helpers import ensure_utf8_stdio
+
 
 # ─── Dataset configuration ────────────────────────────────────────────────────
 
@@ -42,21 +46,21 @@ DEFAULT_DATASETS = [
         'name':    'single',
         'label':   'Single-Sentence',
         'csv':     'data/dataset_single_sentence.csv',
-        'out_dir': 'models/single',
+        'out_dir': 'models',
         'results': 'results/single',
     },
     {
         'name':    'medium',
         'label':   'Medium-Sentences',
         'csv':     'data/dataset_medium_sentences.csv',
-        'out_dir': 'models/medium',
+        'out_dir': 'models',
         'results': 'results/medium',
     },
     {
         'name':    'long',
         'label':   'Long-Sentences',
         'csv':     'data/dataset_long_sentences.csv',
-        'out_dir': 'models/long',
+        'out_dir': 'models',
         'results': 'results/long',
     },
 ]
@@ -71,7 +75,7 @@ def _fmt_time(seconds: float) -> str:
 
 
 def run_dataset(dataset_cfg: dict, epochs: int, skip_cv: bool,
-                offline: bool = False) -> dict:
+                offline: bool = False, group_by: str = 'pair') -> dict:
     """
     Run train.py then evaluate.py for one dataset configuration.
     Returns a dict with timing + the path to the results directory.
@@ -96,12 +100,6 @@ def run_dataset(dataset_cfg: dict, epochs: int, skip_cv: bool,
     print(f'  Results : {results}/')
     print(f'{"="*70}\n')
 
-    # Dataset-specific model paths (matching evaluate.py naming convention)
-    import os as _os
-    ds_stem      = _os.path.splitext(_os.path.basename(csv))[0]
-    gnn_path     = f'nlp_dominator_gnn_{ds_stem}.pth'
-    scorer_path  = f'nlp_dominator_scorer_{ds_stem}.pkl'
-
     env = os.environ.copy()
     if offline:
         env['HF_HUB_OFFLINE']       = '1'
@@ -116,6 +114,7 @@ def run_dataset(dataset_cfg: dict, epochs: int, skip_cv: bool,
         '--epochs',         str(epochs),
         '--output-dir',     out_dir,
         '--output-results', results,
+        '--group-by',       group_by,
     ]
     if offline:
         train_cmd.append('--offline')
@@ -131,18 +130,19 @@ def run_dataset(dataset_cfg: dict, epochs: int, skip_cv: bool,
             'elapsed': _fmt_time(elapsed), 'results_dir': None,
         }
 
-    # ── Step 2: Evaluate (uses dataset-specific fine-tuned models) ───────────
+    # ── Step 2: Evaluate (loads the dataset-specific models train.py saved) ──
     eval_cmd = [
         sys.executable, 'evaluate.py',
         '--dataset',        csv,
-        '--gnn-model',      gnn_path,
-        '--scorer-model',   scorer_path,
+        '--models-dir',     out_dir,
         '--output-results', results,
+        '--epochs',         str(epochs),
+        '--group-by',       group_by,
     ]
     if skip_cv:
         eval_cmd.append('--skip-cv')
     if offline:
-        eval_cmd.append('--offline') if '--offline' in train_cmd else None
+        eval_cmd.append('--offline')
 
     print(f'[{label}] Step 2/2: Evaluating...')
     eval_proc = subprocess.run(eval_cmd, text=True, env=env)
@@ -151,11 +151,13 @@ def run_dataset(dataset_cfg: dict, epochs: int, skip_cv: bool,
     status = 'ok' if eval_proc.returncode == 0 else f'FAILED (eval exit {eval_proc.returncode})'
     print(f'\n[{label}] Finished in {_fmt_time(elapsed)} — {status}')
 
-    # Find the newest timestamped sub-dir
+    # Find the newest evaluate_<timestamp> sub-dir (train.py writes train_<timestamp>
+    # dirs next to it, which sort after 'evaluate_' and lack the full baselines/CV)
     results_dir = None
     if os.path.isdir(results):
         sub_dirs = sorted(
-            [d for d in os.listdir(results) if os.path.isdir(os.path.join(results, d))],
+            [d for d in os.listdir(results)
+             if d.startswith('evaluate_') and os.path.isdir(os.path.join(results, d))],
             reverse=True,
         )
         if sub_dirs:
@@ -183,8 +185,10 @@ def build_comparison(run_results: list) -> pd.DataFrame:
         if not os.path.exists(metrics_csv):
             continue
         df = pd.read_csv(metrics_csv)
-        # Keep only the best model row (Proposed / Full + Overrides)
-        best = df[df['model'].str.contains('Proposed|Override', case=False, regex=True)]
+        # Keep only the proposed model row (Full + Overrides).  A looser
+        # 'Proposed|Override' match also hits 'Full Ensemble (no override)',
+        # which comes first in the table.
+        best = df[df['model'].str.contains(r'Full \+ Overrides', case=False, regex=True)]
         if best.empty:
             best = df.tail(1)
         row = best.iloc[0].to_dict()
@@ -236,6 +240,8 @@ def parse_args():
                    help='GNN training epochs per dataset (default: 5)')
     p.add_argument('--skip-cv', action='store_true',
                    help='Pass --skip-cv to evaluate.py (not used for train.py)')
+    p.add_argument('--group-by', choices=('pair', 'question'), default='pair',
+                   help='Split unit passed to train.py / evaluate.py (default: pair)')
     p.add_argument('--offline', action='store_true',
                    help='Load all HuggingFace models from local cache only '
                         '(no internet). Use after a first successful online run.')
@@ -243,6 +249,7 @@ def parse_args():
 
 
 def main():
+    ensure_utf8_stdio()
     args = parse_args()
 
     # Build dataset list
@@ -254,16 +261,21 @@ def main():
                 'name':    name,
                 'label':   name.replace('_', ' ').title(),
                 'csv':     csv_path,
-                'out_dir': f'models/{name}',
+                'out_dir': 'models',
                 'results': f'results/{name}',
             })
     else:
-        datasets = DEFAULT_DATASETS
+        datasets = [dict(cfg) for cfg in DEFAULT_DATASETS]
+    if args.group_by != 'pair':
+        for cfg in datasets:
+            cfg['out_dir'] = f'models/{args.group_by}_split'
+            cfg['results'] = f"{cfg['results']}_{args.group_by}"
 
     print(f'\n{"#"*70}')
     print(f'  Bengali Answer Evaluation — Multi-Dataset Run')
     print(f'  Datasets : {len(datasets)}')
     print(f'  Epochs   : {args.epochs}')
+    print(f'  Split    : grouped by {args.group_by}')
     print(f'{"#"*70}')
 
     total_start = time.time()
@@ -271,7 +283,7 @@ def main():
 
     for cfg in datasets:
         result = run_dataset(cfg, epochs=args.epochs, skip_cv=args.skip_cv,
-                             offline=args.offline)
+                             offline=args.offline, group_by=args.group_by)
         run_results.append(result)
 
     total_elapsed = time.time() - total_start
@@ -291,17 +303,18 @@ def main():
 
     # Save comparison CSV
     if not comparison_df.empty:
-        out_path = os.path.join('results', 'comparison_all_datasets.csv')
+        suffix = '' if args.group_by == 'pair' else f'_{args.group_by}'
+        out_path = os.path.join('results', f'comparison_all_datasets{suffix}.csv')
         os.makedirs('results', exist_ok=True)
         comparison_df.to_csv(out_path, index=False)
         print(f'\n[OK] Comparison table saved → {out_path}')
 
     # ── Results directory listing ─────────────────────────────────────────
     print(f'\n  Models saved:')
-    for cfg in datasets:
-        if os.path.isdir(cfg['out_dir']):
-            files = os.listdir(cfg['out_dir'])
-            print(f'    {cfg["out_dir"]:30s}  {files}')
+    for out_dir in sorted({cfg['out_dir'] for cfg in datasets}):
+        if os.path.isdir(out_dir):
+            files = os.listdir(out_dir)
+            print(f'    {out_dir:30s}  {files}')
 
     print()
 

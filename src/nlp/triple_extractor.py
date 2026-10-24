@@ -3,21 +3,31 @@ triple_extractor.py
 ===================
 Relation triple extraction from Bengali text using BNLP POS tags.
 
-Improvements over the original:
-  - Relation = rightmost VERB (VBZ/VBD/VBP/VBN/VBG/VB) tag, NOT always words[-1].
-  - Subject   = first PROPN/NOUN/PRON token, NOT always words[0].
-  - Object    = subsequent PROPN/NOUN tokens after subject, joined.
-  - Adverbs (RB) are concatenated to the verb to enrich the relation.
-  - Compound sentences detected via CC (conjunction) tags are split and each
-    sub-clause produces its own triple.
-  - Postposition-role triples retain the specific role label.
-  - Returned triples carry a 'triple_type' label for downstream graph typing.
+Every clause becomes a small predicate-centred graph:
+
+    subject --agent--> PREDICATE --object/location/time/count--> argument
+    genitive --possessive--> the noun it modifies
+    noun --quality--> adjective
+
+  - The predicate (verb, with its negation and the noun of a compound verb
+    such as 'বধ করেছিলেন') is a node of its own, so the GNN sees the verb and
+    whether it is negated.
+  - Consecutive proper nouns ('রবীন্দ্রনাথ ঠাকুর') and number + unit/time word
+    ('১৯৭১ সালে') are merged into one node.
+  - Each argument is a separate node; possessives and adjectives attach to
+    the noun they modify, not to the subject.
+  - Compound sentences are split on coordinating conjunctions (BIS 'CCD').
+
+Triples are (head_id, relation, tail_id, triple_type).  Predicate node ids are
+'PRED::<text>::<n>' so identical verbs in different clauses stay separate;
+entity ids are their text, so an entity mentioned twice is one node.
 """
 
 import re as _re
+import unicodedata
 from typing import List, Tuple
 
-from src.utils.helpers import is_bengali_numeral
+from src.utils.helpers import is_bengali_numeral, is_negation_token, strip_case_suffix
 
 try:
     from bnlp import BengaliPOS
@@ -25,61 +35,52 @@ except ImportError:
     BengaliPOS = None
 
 
-# ─── Type aliases ─────────────────────────────────────────────────────────────
-# Each triple is (subject, relation, object, triple_type)
-# triple_type ∈ {'main', 'count', 'quality', 'time', 'location',
-#                'source', 'instrument', 'purpose', 'companion', 'possessive'}
 Triple = Tuple[str, str, str, str]
+PRED_PREFIX = 'PRED::'
+
+
+def _nfc(text: str) -> str:
+    return unicodedata.normalize('NFC', text)
+
+
+def predicate_id(label: str, n: int) -> str:
+    return f'{PRED_PREFIX}{label}::{n}'
+
+
+def node_label(node_id: str) -> str:
+    """Display / embedding text of a node id."""
+    return node_id.split('::')[1] if node_id.startswith(PRED_PREFIX) else node_id
 
 
 class TripleExtractor:
-    """
-    Extract (subject, relation, object, triple_type) triples from Bengali text.
+    """Extract predicate-centred (head, relation, tail, type) triples from Bengali text."""
 
-    Uses BNLP POS tagging to identify:
-      * Real verbs for the relation slot
-      * PROPN / NOUN tokens for subject and object slots
-      * Adverbs attached to the verb for richer relations
-      * Conjunctions to split compound sentences
-      * Postpositions for semantic role triples
-    """
+    CC_TAGS     = {'CCD', 'CC'}
+    VERB_TAGS   = {'VM', 'VAUX', 'VBZ', 'VBD', 'VBP', 'VBN', 'VBG', 'VB'}
+    PROPN_TAGS  = {'NP', 'NNP'}
+    NOUN_TAGS   = {'NC', 'NV', 'PPR', 'PRF', 'PRC', 'PRL', 'PWH',
+                   'NNS', 'NN', 'PRP', 'WP'} | PROPN_TAGS
+    ADJ_TAGS    = {'JJ'}
+    PUNCT_TAGS  = {'PU', 'RDS'}
+    SKIP_TAGS   = {'PP', 'NST', 'CSB', 'CX', 'DAB', 'DRL', 'DWH', 'JQ', 'AMN', 'ALC',
+                   'CIN', 'IN', 'DT', 'RB', 'RP'}
 
-    # Postpositions → semantic role label
-    POSTPOSITIONS = {
-        'কে':    'object',
-        'কেই':   'object',
-        'র':     'possessive',
-        'এর':    'possessive',
-        'তে':    'location',
-        'তেই':   'location',
-        'থেকে':  'source',
-        'হতে':   'source',
-        'দিয়ে':  'instrument',
-        'দ্বারা': 'instrument',
-        'জন্য':  'purpose',
-        'জন্যে': 'purpose',
-        'সাথে':  'companion',
-        'সঙ্গে': 'companion',
-    }
-
-    # Conjunction tags that mark clause boundaries
-    CC_TAGS = {'CC'}
-    # POS tags treated as VERB
-    VERB_TAGS = {'VBZ', 'VBD', 'VBP', 'VBN', 'VBG', 'VB'}
-    # POS tags treated as nominal subjects / objects
-    NOUN_TAGS = {'NNP', 'NNS', 'NN', 'PRP', 'WP'}
-    # POS tags treated as adjectives
-    ADJ_TAGS  = {'JJ'}
-    # POS tags treated as adverbs
-    ADV_TAGS  = {'RB'}
-    # POS tags treated as numerals
-    NUM_TAGS  = {'QT_QTF', 'QT_QTC', 'QF', 'Q', 'NUM'}
-
-    NEGATIONS  = {'না', 'নয়', 'নি', 'নে', 'নেই', 'না-ই', 'নাই'}
-    TIME_WORDS = ['সাল', 'বছর', 'কাল', 'দিন', 'সময়', 'শতাব্দী', 'সালে', 'বছরে']
+    COPULAS     = {_nfc(s) for s in ('হয়', 'হয়েছে', 'হয়েছিল', 'হয়েছিলেন', 'হলো', 'হল',
+                                      'হন', 'ছিল', 'ছিলেন', 'আছে', 'রয়েছে', 'থাকে')}
+    # Verb stems that form compound verbs with a preceding noun/adjective
+    LIGHT_VERB_STEMS = tuple(_nfc(s) for s in ('কর', 'হ', 'দি', 'দে', 'নি', 'পে', 'পা'))
+    TIME_WORDS  = tuple(_nfc(s) for s in ('সাল', 'বছর', 'শতাব্দী', 'শতক', 'খ্রিস্টাব্দ',
+                                          'খ্রিস্টপূর্ব', 'মাস', 'দিন', 'সময়', 'যুগ'))
+    UNIT_WORDS  = TIME_WORDS + tuple(_nfc(s) for s in ('মিটার', 'কিলোমিটার', 'কেজি', 'শতাংশ',
+                                                       'টাকা', 'জন', 'টি'))
+    OBJ_SUFFIXES  = tuple(_nfc(s) for s in ('কে', 'কেই'))
+    POSS_SUFFIXES = tuple(_nfc(s) for s in ('ের', 'য়ের', 'এর', 'দের', 'টির', 'টার'))
+    LOC_SUFFIXES  = tuple(_nfc(s) for s in ('তে', 'তেই', 'ায়'))
+    PASSIVE_MARKERS = {_nfc(s) for s in ('দ্বারা', 'কর্তৃক')}
 
     def __init__(self):
         print('Loading BNLP POS tagger for TripleExtractor...')
+        self._cache = {}
         if BengaliPOS is not None:
             try:
                 self.pos_tagger = BengaliPOS()
@@ -91,158 +92,159 @@ class TripleExtractor:
             print('  [WARN] bnlp package not available. Fallback to simple split.')
             self.pos_tagger = None
 
-    # ─── Internal helpers ─────────────────────────────────────────────────────
+    # ─── Tagging ──────────────────────────────────────────────────────────────
 
     def _tag_words(self, sentence: str) -> List[Tuple[str, str]]:
-        """Return [(word, bnlp_tag), …] for *sentence*."""
+        """Return [(word, bnlp_tag), …] for *sentence* (punctuation removed)."""
         words = sentence.replace('।', '').replace('?', '').split()
         if not words:
             return []
+        tagged = None
         if self.pos_tagger is not None:
             try:
-                return self.pos_tagger.tag(sentence)
+                tagged = self.pos_tagger.tag(sentence)
             except Exception:
-                pass
-        return [(w, 'UNK') for w in words]
+                tagged = None
+        if tagged is None:
+            tagged = [(w, 'UNK') for w in words]
+        out = []
+        for w, t in tagged:
+            w = _nfc(w.strip(',;:।?!\'"'))
+            if not w:
+                continue
+            if is_negation_token(w) and t not in self.VERB_TAGS:
+                t = 'CX'                  # the tagger sometimes calls 'নয়' punctuation
+            elif w in self.COPULAS:
+                t = 'VM'
+            if t not in self.PUNCT_TAGS:
+                out.append((w, t))
+        return out
 
-    def _split_on_conjunctions(
-        self, tagged: List[Tuple[str, str]]
-    ) -> List[List[Tuple[str, str]]]:
-        """
-        Split a tagged token list wherever a CC (coordinating conjunction) appears.
-        Returns a list of sub-lists, each representing one clause.
-        """
+    def _merge_units(self, tagged):
+        """Merge proper-noun runs and number + unit/time word into single tokens."""
+        merged = []
+        for w, t in tagged:
+            if merged:
+                pw, pt = merged[-1]
+                # A case ending marks a new entity ('রাম রাবণকে' is two
+                # people), so only an unmarked token extends the name.
+                if (t in self.PROPN_TAGS and pt in self.PROPN_TAGS
+                        and not pw.endswith(self.POSS_SUFFIXES)
+                        and not w.endswith(self.OBJ_SUFFIXES + self.POSS_SUFFIXES + self.LOC_SUFFIXES)):
+                    merged[-1] = (f'{pw} {w}', pt)
+                    continue
+                if pt == 'NUMBER' and w.startswith(self.UNIT_WORDS):
+                    merged[-1] = (f'{pw} {w}', 'NUMBER')
+                    continue
+            merged.append((w, 'NUMBER' if is_bengali_numeral(w) else t))
+        return merged
+
+    def _split_on_conjunctions(self, tagged):
         clauses, current = [], []
         for tok in tagged:
             if tok[1] in self.CC_TAGS and current:
                 clauses.append(current)
                 current = []
-            else:
+            elif tok[1] not in self.CC_TAGS:
                 current.append(tok)
         if current:
             clauses.append(current)
-        return clauses if clauses else [tagged]
+        return clauses
 
-    def _extract_from_clause(
-        self, clause: List[Tuple[str, str]], neg_flag: bool
-    ) -> List[Triple]:
-        """
-        Extract triples from a single tagged clause (list of (word, tag) pairs).
+    # ─── Clause → triples ─────────────────────────────────────────────────────
 
-        Strategy
-        --------
-        1. Identify the rightmost VERB token → relation.
-        2. Attach any ADV token immediately before the verb → enrich relation.
-        3. First NOUN/PROPN/PRON before verb → subject.
-        4. NOUN/PROPN tokens after verb → object(s).
-        5. Emit special triples for NUM, ADJ, TIME, postposition roles.
-        """
+    def _is_light_verb(self, verb: str) -> bool:
+        return verb.startswith(self.LIGHT_VERB_STEMS)
+
+    def _arg_type(self, word: str, tag: str):
+        """Return the relation linking the predicate to argument *word*, or None."""
+        if tag == 'NUMBER':
+            return 'time' if any(tw in word for tw in self.TIME_WORDS) else 'count'
+        if tag not in self.NOUN_TAGS:
+            return None
+        if word.endswith(self.OBJ_SUFFIXES):           # before '-ে': 'কে' ends in it too
+            return 'object'
+        if any(tw in word for tw in self.TIME_WORDS):
+            return 'time'
+        if word.endswith(self.LOC_SUFFIXES) or (tag in self.PROPN_TAGS and word.endswith('ে')):
+            return 'location'
+        return 'object'
+
+    def _extract_from_clause(self, clause, pred_n: int) -> List[Triple]:
         if not clause:
             return []
+        neg_word = next((w for w, t in clause if is_negation_token(w) and t not in self.VERB_TAGS), None)
+        toks = [(w, t) for w, t in clause if not (is_negation_token(w) and t not in self.VERB_TAGS)]
+        if not toks:
+            return []
 
-        words_only = [w for w, _ in clause]
-
-        # ── Find rightmost VERB ────────────────────────────────────────────
-        verb_idx = None
-        for i in range(len(clause) - 1, -1, -1):
-            if clause[i][1] in self.VERB_TAGS:
-                verb_idx = i
-                break
-
-        # Fallback: if no tagged verb found, use last word (SOV heuristic)
+        # ── Predicate: rightmost verb (+ compound-verb noun), else last token ─
+        verb_idx = next((i for i in range(len(toks) - 1, -1, -1)
+                         if toks[i][1] in self.VERB_TAGS), None)
         if verb_idx is None:
-            verb_idx = len(clause) - 1
+            verb_idx = len(toks) - 1                     # nominal predicate ('রং লাল')
+            start = verb_idx
+        else:
+            start = verb_idx
+            if (verb_idx > 0 and self._is_light_verb(toks[verb_idx][0])
+                    and toks[verb_idx - 1][1] in (self.NOUN_TAGS | self.ADJ_TAGS) - self.PROPN_TAGS):
+                start = verb_idx - 1
+        pred_text = ' '.join(w for w, _ in toks[start:verb_idx + 1])
+        if neg_word:                                     # 'ওঠে না', 'লাল নয়'
+            pred_text += f' {neg_word}'
+        pred = predicate_id(pred_text, pred_n)
 
-        verb_word = clause[verb_idx][0]
+        args = [(i, w, t) for i, (w, t) in enumerate(toks) if not (start <= i <= verb_idx)]
 
-        # ── Attach preceding adverb to relation ───────────────────────────
-        adv_prefix = ''
-        if verb_idx > 0 and clause[verb_idx - 1][1] in self.ADV_TAGS:
-            adv_prefix = clause[verb_idx - 1][0] + '_'
+        # ── Passive: the noun before 'দ্বারা' / 'কর্তৃক' is the agent ─────────
+        passive_agent = next((i - 1 for i, (w, _) in enumerate(toks)
+                              if w in self.PASSIVE_MARKERS and i > 0
+                              and toks[i - 1][1] in self.NOUN_TAGS), None)
 
-        relation_base = adv_prefix + verb_word
-        relation = f'NOT({relation_base})' if neg_flag else relation_base
-
-        # ── Find subject (first NOUN/PROPN/PRON before verb) ──────────────
+        # ── Subject: first unmarked nominal ──────────────────────────────────
         subject = None
-        subject_idx = None
-        for i in range(verb_idx):
-            w, t = clause[i]
-            if t in self.NOUN_TAGS:
-                subject = w
-                subject_idx = i
+        for i, w, t in args:
+            if (i != passive_agent and t in self.NOUN_TAGS
+                    and not w.endswith(self.OBJ_SUFFIXES + self.POSS_SUFFIXES)
+                    and self._arg_type(w, t) == 'object'):
+                subject = i
                 break
-
-        # Fallback to first word if no nominal found before verb
-        if subject is None:
-            subject = words_only[0]
-            subject_idx = 0
-
-        # Anchor used for all sub-triples in this clause
-        anchor = subject
+        if subject is None and passive_agent is None:
+            subject = next((i for i, w, t in args if t in self.NOUN_TAGS), None)
 
         triples: List[Triple] = []
-        obj_parts = []
+        if passive_agent is not None:
+            # 'রাবণের দ্বারা রাম নিহত হয়েছেন': রাবণ acts, রাম is the patient
+            triples.append((strip_case_suffix(toks[passive_agent][0]), 'agent', pred, 'agent'))
+            if subject is not None:
+                triples.append((pred, 'object', toks[subject][0], 'object'))
+        elif subject is not None:
+            triples.append((toks[subject][0], 'agent', pred, 'agent'))
 
-        for i, (word, tag) in enumerate(clause):
-            # Skip subject word, verb word, its adverb, and negations
-            if i == subject_idx or i == verb_idx:
+        def next_noun(after):
+            return next((w for i, w, t in args if i > after and t in self.NOUN_TAGS
+                         and not w.endswith(self.POSS_SUFFIXES)), None)
+
+        for i, w, t in args:
+            if i in (subject, passive_agent) or t in self.SKIP_TAGS:
                 continue
-            if verb_idx > 0 and i == verb_idx - 1 and tag in self.ADV_TAGS:
-                continue   # already embedded in relation
-            if word in self.NEGATIONS:
+            if t in self.ADJ_TAGS:
+                head = next_noun(i)
+                triples.append((head, 'quality', w, 'quality') if head
+                               else (pred, 'quality', w, 'quality'))
                 continue
-
-            # ── Numeric ───────────────────────────────────────────────────
-            if is_bengali_numeral(word) or tag in self.NUM_TAGS:
-                triples.append((anchor, 'count', word, 'count'))
+            if t in self.NOUN_TAGS and w.endswith(self.POSS_SUFFIXES):
+                head = next_noun(i)
+                triples.append((w, 'possessive', head, 'possessive') if head
+                               else (pred, 'object', w, 'object'))
                 continue
+            rel = self._arg_type(w, t)
+            if rel:
+                triples.append((pred, rel, w, rel))
 
-            # ── Adjective → quality triple ────────────────────────────────
-            if tag in self.ADJ_TAGS:
-                triples.append((anchor, 'quality', word, 'quality'))
-                continue
-
-            # ── Time expression ───────────────────────────────────────────
-            if any(tw in word for tw in self.TIME_WORDS):
-                triples.append((anchor, 'time', word, 'time'))
-                continue
-
-            # ── Postposition role ──────────────────────────────────────────
-            matched_role = None
-            for pp, role in self.POSTPOSITIONS.items():
-                if word.endswith(pp) and role == 'location':
-                    matched_role = role
-                    break
-            if matched_role:
-                triples.append((anchor, matched_role, word, matched_role))
-                continue
-
-            # ── Possessive postposition ───────────────────────────────────
-            poss_role = None
-            for pp, role in self.POSTPOSITIONS.items():
-                if word.endswith(pp) and role == 'possessive':
-                    poss_role = role
-                    break
-            if poss_role:
-                triples.append((anchor, 'possessive', word, 'possessive'))
-                continue
-
-            # ── Nominal after verb → part of object ───────────────────────
-            if i > verb_idx and tag in self.NOUN_TAGS:
-                obj_parts.append(word)
-                continue
-
-            # ── Everything else → collect into object ─────────────────────
-            if i > verb_idx:
-                obj_parts.append(word)
-
-        # Build main triple
-        obj_candidate = ' '.join(obj_parts) if obj_parts else '[NONE]'
-        main_triple: Triple = (anchor, relation, obj_candidate, 'main')
-        if main_triple not in triples:
-            triples.append(main_triple)
-
+        if not triples:
+            # A lone predicate: 'none' triples only add the node
+            triples.append((pred, 'none', pred, 'none'))
         return triples
 
     # ─── Public API ───────────────────────────────────────────────────────────
@@ -253,36 +255,24 @@ class TripleExtractor:
 
         Returns
         -------
-        list of (subject, relation, object, triple_type) tuples
+        list of (head_id, relation, tail_id, triple_type) tuples
         """
         text = raw_text if raw_text else ''
         if not text:
             return []
+        if text in self._cache:
+            return self._cache[text]
 
         all_triples: List[Triple] = []
-        # Split on sentence boundaries: Bengali full stop and newlines
-        sentences = [s.strip() for s in _re.split(r'[।\n]+', text) if s.strip()]
-
+        pred_n = 0
+        sentences = [s.strip() for s in _re.split(r'[।?!\n]+', text) if s.strip()]
         for sent in sentences:
-            # Clean punctuation but keep commas for now (stripped per-token below
-            # only if needed); POS tagger can handle them.
-            clean_sent = sent.replace('?', '')
-            tagged = self._tag_words(clean_sent)
-            if not tagged:
-                continue
-
-            neg_flag = any(w in self.NEGATIONS for w, _ in tagged)
-
-            # Split compound sentence on coordinating conjunctions
-            clauses = self._split_on_conjunctions(tagged)
-
-            for clause in clauses:
-                if len(clause) < 2:
-                    continue
-                clause_triples = self._extract_from_clause(clause, neg_flag)
-                # Deduplicate before extending
-                for t in clause_triples:
+            tagged = self._merge_units(self._tag_words(sent))
+            for clause in self._split_on_conjunctions(tagged):
+                for t in self._extract_from_clause(clause, pred_n):
                     if t not in all_triples:
                         all_triples.append(t)
+                pred_n += 1
 
+        self._cache[text] = all_triples
         return all_triples
