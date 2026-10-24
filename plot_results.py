@@ -29,6 +29,10 @@ import numpy as np
 import pandas as pd
 from matplotlib.colors import LinearSegmentedColormap
 
+from src.config import NUM_ADVERSARIAL
+from src.data.dataset import adversarial_category_ranges
+from src.utils.helpers import ensure_utf8_stdio
+
 
 # ─── Colour palette ───────────────────────────────────────────────────────────
 PALETTE     = ['#4C72B0', '#DD8452', '#55A868', '#C44E52', '#8172B2', '#937860']
@@ -89,7 +93,7 @@ def plot_ablation(metrics_csv: str, out_path: str):
 
 # ─── 2. Predicted vs True scatter ─────────────────────────────────────────────
 
-def plot_scatter(predictions_csv: str, out_path: str, num_adversarial: int = 50):
+def plot_scatter(predictions_csv: str, out_path: str, num_adversarial: int = NUM_ADVERSARIAL):
     """
     Scatter plot of predicted vs true score.
      • Normal samples  → blue dots
@@ -169,18 +173,12 @@ def plot_confusion_matrix(predictions_csv: str, out_path: str, threshold: float 
 
 # ─── 4. Adversarial-type breakdown ────────────────────────────────────────────
 
-_ADV_CATEGORIES = {
-    'Karak Reversal':  list(range(0, 17)),    # first 17 adversarial rows
-    'Negation':        list(range(17, 34)),   # next 17
-    'Wrong Number':    list(range(34, 38)),   # 4 rows
-    'Wrong Location':  list(range(38, 40)),   # 2 rows
-    'Partial Cover':   list(range(40, 41)),   # 1 row
-    'Voice Change':    list(range(41, 50)),   # remaining
-}
+# Row offsets of each category within the adversarial block (see dataset.py)
+_ADV_CATEGORIES = dict(adversarial_category_ranges())
 
 
 def plot_adversarial_breakdown(predictions_csv: str, out_path: str,
-                                num_adversarial: int = 50):
+                                num_adversarial: int = NUM_ADVERSARIAL):
     """
     Bar chart showing mean absolute error and mean predicted score
     for each adversarial error category.
@@ -254,6 +252,9 @@ def plot_cv_folds(cv_csv: str, out_path: str):
         print('[Plot] No numeric fold data — skipping CV folds plot.')
         return
     df_folds['fold'] = df_folds['fold'].astype(int)
+    # The summary row makes pandas read these columns as strings
+    for col in ('pearson', 'mae'):
+        df_folds[col] = pd.to_numeric(df_folds[col])
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9, 4))
 
@@ -287,13 +288,13 @@ def parse_args():
     p = argparse.ArgumentParser(description='Bengali Answer Eval — Plot Generator')
     p.add_argument('--results-dir', type=str, required=True,
                    help='Path to a timestamped run directory (e.g. results/train_20260409_023500)')
-    p.add_argument('--num-adversarial', type=int, default=50)
+    p.add_argument('--num-adversarial', type=int, default=NUM_ADVERSARIAL)
     p.add_argument('--save-pdf', action='store_true',
                    help='Also save a .pdf alongside each .png')
     return p.parse_args()
 
 
-def generate_all_plots(results_dir: str, num_adversarial: int = 50,
+def generate_all_plots(results_dir: str, num_adversarial: int = NUM_ADVERSARIAL,
                        save_pdf: bool = False):
     """
     Generate all available plots for a given results directory.
@@ -340,6 +341,7 @@ def generate_all_plots(results_dir: str, num_adversarial: int = 50,
 
 
 def main():
+    ensure_utf8_stdio()
     args = parse_args()
     if not os.path.isdir(args.results_dir):
         raise FileNotFoundError(f'Results directory not found: {args.results_dir}')

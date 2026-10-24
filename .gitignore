@@ -13,17 +13,22 @@ env/
 ENV/
 
 # ─── Trained model weights (large binary files) ───────────────────────────────
-models/
+# Root-anchored: a bare 'models/' also matched src/models/ and hid the source.
+# Weights are distributed through the Hugging Face repo instead.
+/models/*
 *.pth
 *.pt
 *.pkl
+*.npz
 *.joblib
 *.h5
 *.onnx
 
-# ─── Dataset files (large CSVs) ───────────────────────────────────────────────
-data/
-*.csv
+# ─── Dataset files ────────────────────────────────────────────────────────────
+# The datasets are small and needed to reproduce the results, so they are
+# tracked (a bare 'data/' also matched src/data/).  Augmented copies are
+# regenerated on the first run.
+/data/*_augmented.csv
 
 # ─── Zip archives ─────────────────────────────────────────────────────────────
 *.zip
@@ -84,4 +89,7 @@ secrets.json
 # Keep the project report PDF
 !report.pdf
 # Keep the empty models/ directory as a download target
-!models/.gitkeep
+!/models/.gitkeep
+# Keep the report source, its figures and the compiled PDF
+!/report/
+!/report/**

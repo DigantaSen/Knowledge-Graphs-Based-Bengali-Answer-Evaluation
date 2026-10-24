@@ -9,7 +9,7 @@ A modular, end-to-end pipeline for automatically scoring Bengali short-answer re
 ## 📂 Project Structure
 
 ```
-ProjectFinal3/
+Knowledge-Graphs-Based-Bengali-Answer-Evaluation/
 │
 ├── data/                            ← Dataset CSVs (place your data here)
 │   ├── dataset_single_sentence.csv
@@ -17,9 +17,12 @@ ProjectFinal3/
 │   ├── dataset_medium_sentences_augmented.csv  ← auto-generated on first run
 │   └── dataset_long_sentences.csv
 │
+├── datasets/clean_synthetic/        ← Clean synthetic data sources (JSON) + build.py + rubric README
+├── report/                          ← Revised report: report.tex (XeLaTeX), figures/, report.pdf
+│
 ├── models/                          ← Saved GNN weights + scorer (auto-created)
 │   ├── nlp_dominator_gnn_<dataset_stem>.pth
-│   └── nlp_dominator_scorer_<dataset_stem>.pkl
+│   └── nlp_dominator_scorer_<dataset_stem>.npz   ← plain arrays, no pickle
 │
 ├── results/                         ← Timestamped run output folders (auto-created)
 │   └── train_YYYYMMDD_HHMMSS/
@@ -41,16 +44,17 @@ ProjectFinal3/
 ├── src/
 │   ├── config.py                    ← All paths, model IDs, hyper-parameters
 │   ├── data/
-│   │   └── dataset.py               ← Data loading + adversarial augmentation
+│   │   ├── dataset.py               ← Loading, adversarial samples, dedup, split, templates
+│   │   └── synthetic.py             ← Synthetic negation / swap / wrong-number training rows
 │   ├── preprocessing/
-│   │   └── text_preprocessor.py     ← Indic NLP normalisation + tokenisation
+│   │   └── text_preprocessor.py     ← Indic NLP normalisation
 │   ├── nlp/
-│   │   ├── dependency_parser.py     ← BNLP POS-based dependency parser
+│   │   ├── dependency_parser.py     ← BNLP POS-based roles (subject, -কে object, passive agent)
 │   │   ├── coreference.py           ← Rule-based coreference resolution
-│   │   └── triple_extractor.py      ← (Subject, Relation, Object) extraction
+│   │   └── triple_extractor.py      ← Predicate-centred triples (verb + negation as a node)
 │   ├── graph/
 │   │   ├── kg_constructor.py        ← Knowledge graph (NetworkX)
-│   │   └── embedder.py              ← LaBSE / BanglaBERT embedder + node embs
+│   │   └── embedder.py              ← LaBSE (sentences, words, nodes) + BanglaBERT baseline
 │   ├── models/
 │   │   ├── siamese_gnn.py           ← Siamese GAT-GNN + PyG data converter
 │   │   └── answer_scorer.py         ← XGBoost + MLP ensemble scorer
@@ -58,13 +62,13 @@ ProjectFinal3/
 │   │   └── karak_validator.py       ← Semantic role (Karak) validation
 │   ├── evaluation/
 │   │   ├── overrides.py             ← Hard post-processing overrides
-│   │   └── metrics.py               ← Pearson / Spearman / MAE / F1 metrics
+│   │   └── metrics.py               ← Pearson / MAE / F1 / macro-F1 + bootstrap CIs
+│   ├── experiment.py                ← Steps shared by train.py / evaluate.py / demo.py
 │   ├── features/
-│   │   └── pipeline.py              ← Feature extraction + GNN train/infer
+│   │   └── pipeline.py              ← Feature extraction (shared by train/eval/demo) + GNN
 │   └── utils/
-│       ├── helpers.py               ← ROUGE-L, negation check, Bengali font
-│       ├── results_saver.py         ← Run output persistence (CSV, MD, JSON, plots)
-│       └── results_logger.py        ← Logging helper
+│       ├── helpers.py               ← Tokenising, sentence alignment, negation, numbers, ROUGE-L
+│       └── results_saver.py         ← Run output persistence (CSV, MD, JSON, plots)
 │
 ├── train.py                         ← Full training pipeline (entry point)
 ├── evaluate.py                      ← Stand-alone evaluation + 5-fold CV
@@ -81,13 +85,16 @@ ProjectFinal3/
 
 ### 1 — Python version
 
-Python **3.9 or 3.10** is recommended (PyTorch Geometric wheels are most stable there).
+Tested with **Python 3.12** on CPU, using the exact versions pinned in `requirements.txt`.
 
 ### 2 — Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
+
+`requirements.txt` also installs BanglaBERT's text normaliser from GitHub
+(`csebuetnlp/normalizer`), so `git` must be available.
 
 > **Note on PyTorch Geometric:** Install the wheels that match your CUDA version.
 > For CPU-only (simplest):
@@ -101,9 +108,13 @@ pip install -r requirements.txt
 >     -f https://data.pyg.org/whl/torch-2.0.0+cu118.html
 > ```
 
-### 3 — Download BNLP models (first run only)
+### 3 — Download BNLP / NLTK resources (first run only)
 
-The BNLP dependency parser downloads its POS model automatically the first time it is used. Make sure you have an internet connection on the first run (or use `--offline` after your initial setup — see below).
+```bash
+python -c "import nltk; nltk.download('punkt'); nltk.download('punkt_tab')"
+```
+
+Without `punkt`, BNLP retries the download on every start. The BNLP dependency parser downloads its POS model automatically the first time it is used. Make sure you have an internet connection on the first run (or use `--offline` after your initial setup — see below).
 
 ---
 
@@ -134,6 +145,15 @@ Each CSV must have the following columns:
 
 On the **first run** for each dataset, an augmented CSV is automatically written alongside the source file (e.g., `data/dataset_medium_sentences_augmented.csv`). Subsequent runs load this cached file directly.
 
+**Clean synthetic data:** `datasets/clean_synthetic/` holds 514 additional rows (54 new questions) written without templates and scored by a fixed rubric — synthetic, not human grades. `python datasets/clean_synthetic/build.py` writes `data/dataset_clean_<tier>.csv` and `data/dataset_<tier>_plus_clean.csv` (original + clean, with a `source` column). See `datasets/clean_synthetic/README.md`.
+
+**Data handling (see `src/config.py`):**
+
+- `DEDUPLICATE_PAIRS` — identical (question, reference, student) rows are merged and their scores averaged (1000 → 669 single, 1000 → 492 medium, 320 → 291 long), because the datasets repeat pairs with conflicting scores.
+- `SPLIT_GROUP_BY` / `--group-by` — `pair` (unseen answers, default) or `question` (unseen questions).
+- `SYNTHETIC_ERRORS` — rule-generated negated / role-swapped / wrong-number answers (score 0) plus unchanged copies are added to the **training split only**. Sentences of the hand-written adversarial test samples are excluded.
+- Many student answers are templated (e.g. 695/1000 medium answers start or end with phrases such as `এই প্রশ্নের উত্তরে`, `আরও তথ্য প্রয়োজন।`). Templates are detected from the data and results are also reported on the non-templated subset.
+
 ---
 
 ## 🚀 Running the Project
@@ -146,14 +166,15 @@ python train.py
 
 This will:
 1. Load `data/dataset_single_sentence.csv` (or whichever CSV is found first)
-2. Write / load a per-dataset augmented CSV with 50 adversarial examples
-3. Extract KG + GNN + Karak features
-4. Train the Siamese GAT-GNN (5 epochs by default)
-5. Train the XGBoost + MLP ensemble scorer
-6. Apply hard overrides (negation / numeric caps)
-7. Print a metric comparison table
-8. Save `models/nlp_dominator_gnn_<dataset_stem>.pth` and `models/nlp_dominator_scorer_<dataset_stem>.pkl`
-9. Persist a timestamped results folder under `results/train_YYYYMMDD_HHMMSS/`
+2. Write / load a per-dataset augmented CSV with 51 adversarial examples
+3. Split train/test by group (`SPLIT_GROUP_BY` in `src/config.py`: identical answer pairs by default, or whole questions) so duplicated rows never straddle the split; all adversarial rows go to test
+4. Add synthetic error rows to the training split, then extract KG + GNN + Karak features
+5. Train the Siamese GAT-GNN (5 epochs by default; seeded, mini-batched)
+6. Train the XGBoost + MLP ensemble scorer on **out-of-fold** GNN similarities; the XGBoost/MLP weight is chosen on out-of-fold training predictions
+7. Apply hard overrides (negation cap 30 / numeric cap 25) — single-sentence references only
+8. Print metric tables for the full test set, normal rows, non-templated rows and adversarial rows, with bootstrap 95% CIs against the best baseline
+9. Save `models/nlp_dominator_gnn_<dataset_stem>.pth` and `models/nlp_dominator_scorer_<dataset_stem>.npz`
+10. Persist a timestamped results folder under `results/train_YYYYMMDD_HHMMSS/`
 
 **Optional flags:**
 
@@ -163,6 +184,7 @@ This will:
 | `--epochs N` | `5` | Number of GNN training epochs |
 | `--output-dir DIR` | `models` | Directory to save trained models |
 | `--output-results DIR` | `results` | Parent folder for the timestamped run-output directory |
+| `--group-by pair\|question` | `pair` | Split unit (unseen answers / unseen questions) |
 | `--offline` | off | Force offline mode — use only locally cached HuggingFace models |
 
 ```bash
@@ -188,19 +210,25 @@ Loads (or trains) dataset-specific models and evaluates them on the held-out tes
 
 **Model loading behaviour:**
 
-- Looks for `models/nlp_dominator_gnn_<dataset_stem>.pth` and the matching scorer.
-- If dataset-specific weights are missing, falls back to the paths given via `--gnn-model` / `--scorer-model`.
-- If no weights are found at all, the GNN is fine-tuned from scratch and saved automatically.
+- Looks for `<models-dir>/nlp_dominator_gnn_<dataset_stem>.pth` and the matching scorer (the files `train.py` saves), or the explicit `--gnn-model` / `--scorer-model` paths.
+- Missing files are downloaded from the HuggingFace repo when default paths are used.
+- If no GNN weights are found, the GNN and scorer are trained from scratch and saved. A saved scorer is only reused together with its saved GNN.
+- Baselines (LaBSE, ROUGE-L, BanglaBERT, GNN-only) are linearly calibrated on the train split before scoring, so they are compared fairly with the trained ensemble.
+- Cross-validation extracts features once, uses grouped folds, and trains a fresh GNN and scorer per fold (with that fold's synthetic rows).
 
 **Optional flags:**
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--dataset PATH` | auto-detected | Dataset CSV to evaluate on |
-| `--gnn-model PATH` | `models/nlp_dominator_gnn.pth` | Fallback GNN weights path |
-| `--scorer-model PATH` | `models/nlp_dominator_scorer.pkl` | Fallback scorer weights path |
+| `--models-dir DIR` | `models` | Directory holding the per-dataset model files |
+| `--gnn-model PATH` | `<models-dir>/nlp_dominator_gnn_<stem>.pth` | Explicit GNN weights path |
+| `--scorer-model PATH` | `<models-dir>/nlp_dominator_scorer_<stem>.npz` | Explicit scorer path |
+| `--epochs N` | `5` | GNN epochs when training is needed (including every CV fold) |
+| `--group-by pair\|question` | `pair` | Split unit (unseen answers / unseen questions) |
 | `--skip-cv` | off | Skip 5-fold cross-validation (much faster) |
 | `--output-results DIR` | `results` | Parent folder for the timestamped run-output directory |
+| `--offline` | off | Force offline mode — use only locally cached HuggingFace models |
 
 ```bash
 # Full evaluation with 5-fold cross-validation
@@ -214,7 +242,7 @@ python evaluate.py --dataset data/dataset_long_sentences.csv
 
 # Evaluate using explicit model paths
 python evaluate.py --gnn-model models/nlp_dominator_gnn_dataset_medium_sentences.pth \
-                   --scorer-model models/nlp_dominator_scorer_dataset_medium_sentences.pkl
+                   --scorer-model models/nlp_dominator_scorer_dataset_medium_sentences.npz
 ```
 
 ---
@@ -239,7 +267,7 @@ Opens a web UI at **http://localhost:7860** where you can paste a question, a re
 python demo.py --share
 ```
 
-> **Important:** The demo looks for `models/nlp_dominator_gnn.pth` and `models/nlp_dominator_scorer.pkl` by default. Run `train.py` first, or copy the dataset-specific model files to those paths. The demo will launch with random weights if no files are found, but scores will be meaningless.
+> **Important:** The demo scans `models/` for `nlp_dominator_gnn_<dataset_stem>.pth` / `nlp_dominator_scorer_<dataset_stem>.npz` pairs and picks one by answer length. Run `train.py` (or `run_all_datasets.py`) first. Without trained files it falls back to a heuristic score.
 
 ---
 
@@ -249,19 +277,19 @@ python demo.py --share
 python run_all_datasets.py
 ```
 
-Runs `train.py` then `evaluate.py` on **all three datasets one by one**, with separate model and results folders per dataset:
+Runs `train.py` then `evaluate.py` on **all three datasets one by one**; `evaluate.py` loads the models `train.py` just saved. Model files are named per dataset, so they share one folder (which is where `evaluate.py` and `demo.py` look):
 
 ```
 models/
-├── single/    ← GNN + scorer trained on dataset_single_sentence.csv
-├── medium/    ← GNN + scorer trained on dataset_medium_sentences.csv
-└── long/      ← GNN + scorer trained on dataset_long_sentences.csv
+├── nlp_dominator_{gnn,scorer}_dataset_single_sentence.{pth,pkl}
+├── nlp_dominator_{gnn,scorer}_dataset_medium_sentences.{pth,pkl}
+└── nlp_dominator_{gnn,scorer}_dataset_long_sentences.{pth,pkl}
 
 results/
 ├── single/    ← metrics, predictions, figures for single-sentence
 ├── medium/    ← ...
 ├── long/      ← ...
-└── comparison_all_datasets.csv  ← side-by-side Pearson/MAE/F1 table
+└── comparison_all_datasets.csv  ← side-by-side Pearson/MAE/F1 table (from each evaluate_* run)
 ```
 
 **Optional flags:**
@@ -271,6 +299,7 @@ results/
 | `--epochs N` | `5` | GNN epochs per dataset |
 | `--datasets CSV1 CSV2 …` | all 3 | Run only specific CSVs |
 | `--skip-cv` | off | Pass `--skip-cv` to `evaluate.py` for each dataset |
+| `--group-by pair\|question` | `pair` | Split unit; `question` writes to `models/question_split/` and `results/<name>_question/` |
 | `--offline` | off | Use locally cached HuggingFace models only |
 
 ```bash
@@ -294,6 +323,10 @@ Every time you run `train.py` or `evaluate.py`, a **timestamped results folder**
 results/
 └── train_YYYYMMDD_HHMMSS/          ← one folder per run
     ├── metrics_table.csv            ← all model rows: Pearson, Spearman, MAE, RMSE, R², F1, …
+    ├── metrics_table_normal.csv     ← same, normal (non-adversarial) test rows only
+    ├── metrics_table_nontemplated.csv ← normal rows whose student answer is not templated
+    ├── metrics_table_adversarial.csv  ← the 51 hand-written adversarial rows
+    ├── significance.csv             ← bootstrap 95% CIs + paired test vs the best baseline
     ├── cv_results.csv               ← per-fold + mean±std (evaluate.py only)
     ├── predictions.csv              ← per-sample y_true / y_pred_raw / y_pred_final / abs_error
     ├── adversarial_breakdown.csv    ← metrics split by error category (Karak/Negation/…)
@@ -319,7 +352,7 @@ python plot_results.py --results-dir results/train_YYYYMMDD_HHMMSS
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--results-dir DIR` | *(required)* | Path to a results folder |
-| `--num-adversarial N` | `50` | Number of adversarial samples at the end of predictions.csv |
+| `--num-adversarial N` | `51` | Number of adversarial samples at the end of predictions.csv |
 | `--save-pdf` | off | Also save each figure as a `.pdf` |
 
 ### Quick reference
@@ -376,20 +409,22 @@ python plot_results.py --results-dir results/train_YYYYMMDD_HHMMSS
 
 | Package | Version | Purpose |
 |---------|---------|---------|
-| `torch` | ≥ 2.0 | Deep learning core |
-| `torch-geometric` | ≥ 2.4 | Graph Neural Networks |
-| `transformers` | ≥ 4.35 | LaBSE, BanglaBERT, NER models |
-| `sentence-transformers` | ≥ 2.2 | Cosine similarity via LaBSE |
-| `bnlp_toolkit` | ≥ 3.0 | BNLP POS tagger |
-| `indic-nlp-library` | ≥ 0.92 | Bengali text normalisation |
-| `xgboost` | ≥ 2.0 | Ensemble scoring |
-| `networkx` | ≥ 3.0 | Knowledge graph construction |
-| `gradio` | ≥ 4.0 | Interactive demo UI |
-| `scikit-learn` | ≥ 1.3 | Cross-validation, metrics |
-| `scipy` | ≥ 1.11 | Pearson / Spearman correlation |
-| `rouge-score` | ≥ 0.1.2 | ROUGE-L baseline |
-| `matplotlib` | ≥ 3.7 | Result figures |
-| `seaborn` | ≥ 0.12 | Confusion matrix styling |
+| `torch` | 2.11.0 | Deep learning core |
+| `torch-geometric` | 2.7.0 | Graph Neural Networks |
+| `transformers` | 5.5.3 | LaBSE, BanglaBERT, NER models |
+| `sentence-transformers` | 5.4.0 | Cosine similarity via LaBSE |
+| `bnlp_toolkit` | 4.4.1 | BNLP POS tagger |
+| `indic-nlp-library` | 0.92 | Bengali text normalisation |
+| `xgboost` | 3.2.0 | Ensemble scoring |
+| `networkx` | 3.6.1 | Knowledge graph construction |
+| `gradio` | 6.11.0 | Interactive demo UI |
+| `scikit-learn` | 1.8.0 | Cross-validation, metrics |
+| `scipy` | 1.17.1 | Pearson / Spearman correlation |
+| `rouge-score` | 0.1.2 | ROUGE-L baseline |
+| `matplotlib` | 3.10.8 | Result figures |
+| `seaborn` | 0.13.2 | Confusion matrix styling |
+| `normalizer` (csebuetnlp) | git | BanglaBERT input normalisation |
+| `nltk` | 3.9.4 | Tokeniser resources for BNLP |
 
 ---
 

@@ -30,8 +30,9 @@ import torch
 def _resolve_bengali_font():
     """Return (font_path, FontProperties) for the best available Bengali font."""
     _CANDIDATES = [
-        # Windows — Noto variable font installed by the project
-        r"C:\Users\digan\AppData\Local\Microsoft\Windows\Fonts\NotoSansBengali-VariableFont_wdth,wght.ttf",
+        # Windows — per-user Noto variable font install location
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Fonts",
+                     "NotoSansBengali-VariableFont_wdth,wght.ttf"),
     ]
     # Also search the font manager registry
     for _entry in _fm.fontManager.ttflist:
@@ -60,29 +61,18 @@ except ImportError:
         "Gradio is not installed.  Run:  pip install gradio>=4.0"
     )
 
-from transformers import pipeline as hf_pipeline
-
 from src.config import (
     PASS_THRESHOLD,
-    HARD_NEG_CAP,
-    HARD_NUM_CAP,
+    MODELS_DIR,
+    gnn_model_filename,
+    scorer_model_filename,
 )
-from src.evaluation.overrides import compute_wrong_num_flags, apply_hard_overrides
-from src.features.pipeline import (
-    compute_entity_mismatch,
-    get_gnn_similarities,
-)
-from src.utils.helpers import sentence_coverage_score
-from src.graph.embedder import BanglaBERTEmbedder
-from src.graph.kg_constructor import KnowledgeGraphConstructor
+from src.evaluation.overrides import apply_hard_overrides
+from src.experiment import build_components
+from src.features.pipeline import extract_pair_features, get_gnn_similarities, scorer_matrix
 from src.models.answer_scorer import AnswerScorer
-from src.models.siamese_gnn import SiameseGNN, nx_to_pyg_data
-from src.nlp.coreference import BengaliCoreferenceResolver
-from src.nlp.dependency_parser import BengaliDependencyParser
-from src.nlp.triple_extractor import TripleExtractor
-from src.preprocessing.text_preprocessor import TextPreprocessor
-from src.utils.helpers import negation_mismatch, compute_rouge_l
-from src.validation.karak_validator import KarakValidator
+from src.models.siamese_gnn import SiameseGNN
+from src.utils.helpers import ensure_utf8_stdio
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -101,9 +91,9 @@ _TIER_ORDER = [
 ]
 
 
-def _scan_model_pairs(models_dir: str = "models") -> dict:
+def _scan_model_pairs(models_dir: str = MODELS_DIR) -> dict:
     """
-    Scan *models_dir* for matching GNN (.pth) + scorer (.pkl) pairs.
+    Scan *models_dir* for matching GNN (.pth) + scorer (.npz) pairs.
 
     Returns a dict keyed by tier keyword ("single", "medium", "long"),
     each value being {"gnn": path, "scorer": path}.
@@ -114,16 +104,21 @@ def _scan_model_pairs(models_dir: str = "models") -> dict:
         return pairs
 
     pth_files = {f for f in os.listdir(models_dir) if f.endswith(".pth")}
-    pkl_files = {f for f in os.listdir(models_dir) if f.endswith(".pkl")}
+    npz_files = {f for f in os.listdir(models_dir) if f.endswith(".npz")}
 
+    # Prefer models trained on original + clean synthetic data ('_plus_clean')
+    prefer = lambda f: (0 if "_plus_clean" in f else 1, f)
     for stem, label in _TIER_ORDER:
         # Match any .pth file whose name contains the tier keyword
-        gnn_matches = [f for f in pth_files if stem in f.lower()]
-        pkl_matches = [f for f in pkl_files if stem in f.lower()]
-        if gnn_matches and pkl_matches:
+        gnn_matches = sorted((f for f in pth_files if stem in f.lower()), key=prefer)
+        if not gnn_matches:
+            continue
+        # The scorer must come from the same training run as the GNN
+        scorer = gnn_matches[0].replace("nlp_dominator_gnn_", "nlp_dominator_scorer_").replace(".pth", ".npz")
+        if scorer in npz_files:
             pairs[stem] = {
-                "gnn":    os.path.join(models_dir, sorted(gnn_matches)[0]),
-                "scorer": os.path.join(models_dir, sorted(pkl_matches)[0]),
+                "gnn":    os.path.join(models_dir, gnn_matches[0]),
+                "scorer": os.path.join(models_dir, scorer),
                 "label":  label,
             }
 
@@ -212,7 +207,8 @@ def _render_kg_preview(ref_kg, stu_kg):
 
                 # draw_networkx_labels doesn't accept FontProperties directly;
                 # draw them manually so we can set fontproperties per Text object.
-                labels = {node: _truncate_label(node) for node in graph.nodes()}
+                labels = {node: _truncate_label(graph.nodes[node].get("label", node))
+                          for node in graph.nodes()}
                 x_coords, y_coords = zip(*[pos[n] for n in graph.nodes()])
                 ax.set_xlim(min(x_coords) - 0.15, max(x_coords) + 0.15)
                 ax.set_ylim(min(y_coords) - 0.15, max(y_coords) + 0.15)
@@ -237,28 +233,33 @@ def _render_kg_preview(ref_kg, stu_kg):
         return None
 
 
-# ── HuggingFace auto-download ──────────────────────────────────────────────────
+# ── HuggingFace auto-download ─────────────────────────────────────────────
 
 _HF_REPO_ID = "k040902/bengali_question_ans"
 
-# All 6 files stored in the HF repo (3 GNN weights + 3 scorers)
+# Files stored in the HF repo: GNN + scorer per tier, trained on the original
+# data and on original + clean synthetic data ('_plus_clean', preferred)
 _HF_MODEL_FILES = [
-    "nlp_dominator_gnn_dataset_single_sentence.pth",
-    "nlp_dominator_gnn_dataset_medium_sentences.pth",
-    "nlp_dominator_gnn_dataset_long_sentences.pth",
-    "nlp_dominator_scorer_dataset_single_sentence.pkl",
-    "nlp_dominator_scorer_dataset_medium_sentences.pkl",
-    "nlp_dominator_scorer_dataset_long_sentences.pkl",
+    f(f"dataset_{tier}{suffix}")
+    for f in (gnn_model_filename, scorer_model_filename)
+    for suffix in ("", "_plus_clean")
+    for tier in ("single_sentence", "medium_sentences", "long_sentences")
 ]
 
 
-def _ensure_models_downloaded(models_dir: str = "models") -> None:
+def _ensure_models_downloaded(models_dir: str = MODELS_DIR) -> None:
     """
     For every file in _HF_MODEL_FILES, download it from HuggingFace into
     *models_dir* if it is not already present locally.
-    Uses huggingface_hub.hf_hub_download which streams + caches safely.
     """
     os.makedirs(models_dir, exist_ok=True)
+    missing = [
+        f for f in _HF_MODEL_FILES
+        if not os.path.exists(os.path.join(models_dir, f))
+    ]
+    if not missing:
+        print("[INFO] All model files already present in models/.")
+        return
 
     try:
         from huggingface_hub import hf_hub_download
@@ -266,15 +267,6 @@ def _ensure_models_downloaded(models_dir: str = "models") -> None:
         print("[WARN] huggingface_hub not installed. "
               "Run: pip install huggingface_hub\n"
               "      Skipping model download.")
-        return
-
-    missing = [
-        f for f in _HF_MODEL_FILES
-        if not os.path.exists(os.path.join(models_dir, f))
-    ]
-
-    if not missing:
-        print("[INFO] All model files already present in models/.")
         return
 
     print(f"[INFO] {len(missing)} model file(s) missing. "
@@ -289,11 +281,10 @@ def _ensure_models_downloaded(models_dir: str = "models") -> None:
                 filename=filename,
                 repo_type="model",
                 local_dir=models_dir,      # save directly into models/
-                local_dir_use_symlinks=False,
             )
-            # hf_hub_download may place the file somewhere else if local_dir
-            # is not supported by the installed version; copy if needed.
-            if os.path.abspath(cached_path) != os.path.abspath(dest):
+            # With local_dir the file usually already sits at dest; copying a
+            # file onto itself raised WinError 32 and was reported as FAILED.
+            if not os.path.exists(dest):
                 import shutil
                 shutil.copy2(cached_path, dest)
             print(f"done  →  {dest}")
@@ -319,34 +310,13 @@ def _load_components():
         return
 
     # ── Step 0: ensure trained model files exist (download from HF if missing) ─
-    _ensure_models_downloaded("models")
+    _ensure_models_downloaded(MODELS_DIR)
 
     print("[INFO] Loading NLP components …")
-    _COMPONENTS = {
-        "text_processor":   TextPreprocessor(),
-        "dep_parser":       BengaliDependencyParser(),
-        "coref_resolver":   BengaliCoreferenceResolver(),
-        "triple_extractor": TripleExtractor(),
-        "kg_constructor":   KnowledgeGraphConstructor(),
-        "embedder":         BanglaBERTEmbedder(),
-        "validator":        KarakValidator(),
-    }
-
-    # Optional NER
-    _COMPONENTS["ner"] = None
-    try:
-        _COMPONENTS["ner"] = hf_pipeline(
-            "ner",
-            model="Davlan/bert-base-multilingual-cased-ner-hrl",
-            aggregation_strategy="simple",
-            device=-1,
-        )
-        print("[OK] NER pipeline loaded.")
-    except Exception as e:
-        print(f"[WARN] NER unavailable: {e}")
+    _COMPONENTS = build_components()
 
     # Scan models/ directory for available trained pairs
-    _MODEL_PAIRS = _scan_model_pairs("models")
+    _MODEL_PAIRS = _scan_model_pairs(MODELS_DIR)
     if _MODEL_PAIRS:
         labels = ", ".join(f"{v['label']} ({v['gnn']})" for v in _MODEL_PAIRS.values())
         print(f"[OK] Found model pairs: {labels}")
@@ -357,27 +327,20 @@ def _load_components():
 def _get_gnn_and_scorer(tier_key: str, gnn_path: str, scorer_path: str):
     """
     Lazily load and cache GNN + scorer for a given tier.
-    Returns (gnn, scorer, scorer_ready).
+    Returns (gnn, scorer, ready) — ready only when BOTH loaded, because a
+    scorer is only valid together with the GNN it was trained with.
     """
     if tier_key not in _GNN_CACHE:
-        gnn = SiameseGNN()
+        gnn, scorer, ready = SiameseGNN(), AnswerScorer(), False
         try:
-            gnn.load_state_dict(torch.load(gnn_path, map_location="cpu"))
+            gnn.load_state_dict(torch.load(gnn_path, map_location="cpu", weights_only=True))
             gnn.eval()
-            print(f"[OK] GNN loaded from {gnn_path}")
-        except Exception as e:
-            print(f"[WARN] Could not load GNN from {gnn_path}: {e}. Using random weights.")
-        _GNN_CACHE[tier_key] = gnn
-
-    if tier_key not in _SCORER_CACHE:
-        scorer = AnswerScorer()
-        ready  = False
-        try:
             scorer.load_model(scorer_path)
             ready = True
-            print(f"[OK] Scorer loaded from {scorer_path}")
+            print(f"[OK] Models loaded: {gnn_path}, {scorer_path}")
         except Exception as e:
-            print(f"[WARN] Could not load scorer from {scorer_path}: {e}. Falling back to heuristic.")
+            print(f"[WARN] Could not load {gnn_path} / {scorer_path}: {e}. Falling back to heuristic.")
+        _GNN_CACHE[tier_key] = gnn
         _SCORER_CACHE[tier_key] = (scorer, ready)
 
     gnn, (scorer, ready) = _GNN_CACHE[tier_key], _SCORER_CACHE[tier_key]
@@ -391,6 +354,9 @@ def predict_single(question: str, ref_text: str, stu_text: str):
     Score a single (question, reference_answer, student_answer) triple.
     Automatically selects the best-matching trained model from models/ based
     on the average word count of the reference + student answers.
+
+    Features come from the same extract_pair_features() used for training,
+    so the demo scores exactly as evaluate.py does.
 
     Returns
     -------
@@ -411,104 +377,48 @@ def predict_single(question: str, ref_text: str, stu_text: str):
         tier_key = os.path.splitext(os.path.basename(gnn_path))[0]
         gnn, scorer, scorer_ready = _get_gnn_and_scorer(tier_key, gnn_path, scorer_path)
     else:
-        # No trained models at all — use a randomly-initialised GNN
-        tier_key = "__random__"
-        if tier_key not in _GNN_CACHE:
-            _GNN_CACHE[tier_key] = SiameseGNN()
-        gnn = _GNN_CACHE[tier_key]
-        scorer, scorer_ready = AnswerScorer(), False
+        gnn, scorer, scorer_ready = None, None, False
 
-    tp  = _COMPONENTS["text_processor"]
-    dp  = _COMPONENTS["dep_parser"]
-    cr  = _COMPONENTS["coref_resolver"]
-    te  = _COMPONENTS["triple_extractor"]
-    kgc = _COMPONENTS["kg_constructor"]
-    emb = _COMPONENTS["embedder"]
-    val = _COMPONENTS["validator"]
-    ner = _COMPONENTS["ner"]
+    f = extract_pair_features(question, ref_text, stu_text, _COMPONENTS)
+    base_sim, penalty, entity_mm = f["base_sim"], f["penalty"], f["entity_mm"]
+    coverage, rouge_l = f["coverage"], f["rouge_l"]
+    neg_flag, wrong_num = f["neg_mm"], f["wrong_num"]
+    ref_kg, stu_kg = f["ref_kg"], f["stu_kg"]
 
-    # ── Coreference resolution ────────────────────────────────────────────────
-    stu_resolved = cr.resolve(stu_text, question, ref_text) if cr else stu_text
-
-    # ── Baseline cosine similarity ────────────────────────────────────────────
-    base_sim = emb.cosine_similarity(ref_text, stu_resolved)
-
-    # ── Knowledge-graph features ──────────────────────────────────────────────
-    ref_norm   = tp.normalize(ref_text)
-    stu_norm   = tp.normalize(stu_resolved)
-    ref_parsed = dp.parse(ref_norm)
-    stu_parsed = dp.parse(stu_norm)
-
-    ref_triples = te.extract_triples(raw_text=ref_text)
-    stu_triples = te.extract_triples(raw_text=stu_resolved)
-    ref_kg  = kgc.build_graph(ref_triples)
-    stu_kg  = kgc.build_graph(stu_triples)
-    ref_emb = emb.generate_node_embeddings(ref_kg)
-    stu_emb = emb.generate_node_embeddings(stu_kg)
-    ref_pyg = nx_to_pyg_data(ref_kg, ref_emb)
-    stu_pyg = nx_to_pyg_data(stu_kg, stu_emb)
-
-    # ── GNN similarity ────────────────────────────────────────────────────────
-    gnn_sim = get_gnn_similarities(gnn, [ref_pyg], [stu_pyg])[0]
-
-    # ── Karak / semantic-role penalty ─────────────────────────────────────────
-    penalty, _ = val.validate(ref_parsed, stu_parsed,
-                               ref_raw=ref_text, stu_raw=stu_resolved)
-
-    # ── Entity-mismatch score ─────────────────────────────────────────────────
-    entity_mm = compute_entity_mismatch(
-        ref_parsed, stu_parsed, ref_text, stu_resolved,
-        embedder_obj=emb, ner_pipeline_obj=ner,
-    )
-
-    # ── Sentence coverage ─────────────────────────────────────────────────────
-    coverage = sentence_coverage_score(ref_text, stu_resolved, emb)
-
-    # ── Negation flag ─────────────────────────────────────────────────────────
-    neg_flag = negation_mismatch(ref_text, stu_resolved)
-
-    # ── ROUGE-L ───────────────────────────────────────────────────────────────
-    rouge_l = compute_rouge_l(ref_text, stu_resolved)
-
-    # ── Feature vector → raw score ────────────────────────────────────────────
-    X = np.array([[base_sim, gnn_sim, penalty, entity_mm, coverage, neg_flag]])
+    # ── GNN similarity + scorer ───────────────────────────────────────────────
+    gnn_sim = float(get_gnn_similarities(gnn, [f["ref_pyg"]], [f["stu_pyg"]])[0]) if scorer_ready else 0.0
     raw_score = None
     used_heuristic = False
     if scorer_ready:
         try:
-            raw_score = float(scorer.predict_batch(X)[0])
+            scalar_feats = {k: np.array([v]) for k, v in f.items() if isinstance(v, float)}
+            raw_score = float(scorer.predict_batch(scorer_matrix(scalar_feats, [gnn_sim]))[0])
         except Exception as e:
             print(f"[WARN] Scorer prediction failed ({e}). Falling back to heuristic scoring.")
 
     if raw_score is None:
         used_heuristic = True
-        # Heuristic fallback keeps the demo usable when trained scorer weights are unavailable.
+        # Heuristic fallback keeps the demo usable when trained weights are unavailable
+        # (an untrained GNN is not used: its similarity would be noise).
         raw_score = 100.0 * (
-            0.35 * base_sim
-            + 0.25 * gnn_sim
-            + 0.20 * coverage
-            + 0.10 * (1.0 - entity_mm)
-            + 0.10 * rouge_l
+            0.45 * base_sim
+            + 0.25 * coverage
+            + 0.15 * (1.0 - entity_mm)
+            + 0.15 * rouge_l
         )
-        if neg_flag:
-            raw_score -= 10.0
         raw_score -= 10.0 * max(0.0, penalty)
         raw_score = float(np.clip(raw_score, 0.0, 100.0))
 
-    # ── Hard overrides ────────────────────────────────────────────────────────
-    # Build minimal structures expected by the override helpers
-    import pandas as pd
-    dummy_df   = pd.DataFrame({"reference_answer": [ref_text], "student_answer": [stu_text]})
-    wrong_num  = compute_wrong_num_flags([penalty], dummy_df, dp, tp, val)
-    final_arr, _ = apply_hard_overrides(
-        np.array([raw_score]), [neg_flag], [penalty], wrong_num
+    # ── Hard overrides (single-sentence references only) ──────────────────────
+    final_arr, override_log = apply_hard_overrides(
+        np.array([raw_score]), [neg_flag], [wrong_num], [f["multi_sentence"]]
     )
     final_score = float(final_arr[0])
 
     # ── Build explanation ─────────────────────────────────────────────────────
     model_info = (
-        f"heuristic fallback (no trained weights found)"
-        if used_heuristic or gnn_path is None
+        "heuristic fallback (no trained weights found)"
+        if used_heuristic
         else f"{tier_label}  [{os.path.basename(gnn_path)}]"
     )
     explanation = (
@@ -518,27 +428,25 @@ def predict_single(question: str, ref_text: str, stu_text: str):
         f"  Thresholds               : single ≤{_SINGLE_MAX_WORDS}w · medium ≤{_MEDIUM_MAX_WORDS}w · long >{_MEDIUM_MAX_WORDS}w\n"
         f"\n"
         f"━━━ Feature Breakdown ━━━\n"
-        f"  Cosine similarity (LaBSE/BanglaBERT) : {base_sim:.4f}\n"
+        f"  Cosine similarity (LaBSE)            : {base_sim:.4f}\n"
         f"  GNN graph similarity                 : {gnn_sim:.4f}\n"
         f"  Karak / semantic-role penalty        : {penalty:.4f}\n"
         f"  Entity mismatch penalty              : {entity_mm:.4f}\n"
         f"  Sentence coverage score              : {coverage:.4f}\n"
         f"  Negation mismatch flag               : {int(neg_flag)}\n"
+        f"  Wrong-number flag                    : {int(wrong_num)}\n"
         f"  ROUGE-L                              : {rouge_l:.4f}\n"
         f"\n"
         f"━━━ Scores ━━━\n"
         f"  Raw ensemble score           : {raw_score:.2f} / 100\n"
         f"  Final score (after overrides): {final_score:.2f} / 100\n"
     )
-    if neg_flag and final_score < raw_score:
-        explanation += (
-            f"\n⚠️  Score capped at {HARD_NEG_CAP:.0f} due to negation mismatch.\n"
-        )
-    if wrong_num and any(wrong_num) and final_score < raw_score:
-        explanation += (
-            f"\n⚠️  Score capped at {HARD_NUM_CAP:.0f} due to numeric error.\n"
-        )
-    if used_heuristic or gnn_path is None:
+    for reason in override_log[0]:
+        explanation += f"\n⚠️  {reason}.\n"
+    if f["karak_explanations"]:
+        explanation += "\nRole / structure checks:\n" + "".join(
+            f"  - {e}\n" for e in f["karak_explanations"])
+    if used_heuristic:
         explanation += "\nℹ️  Using heuristic fallback scoring because no trained model weights were found in models/.\n"
 
     explanation += (
@@ -756,6 +664,7 @@ def build_interface() -> gr.Blocks:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    ensure_utf8_stdio()
     parser = argparse.ArgumentParser(description="Bengali Answer Evaluation — Gradio Demo")
     parser.add_argument("--share", action="store_true",
                         help="Create a public Gradio link.")

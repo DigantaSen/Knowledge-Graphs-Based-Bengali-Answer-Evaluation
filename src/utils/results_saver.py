@@ -8,7 +8,9 @@ Saved files
 -----------
     results/<timestamp>/
     ├── metrics_table.csv       – One row per model (regression + classification metrics)
-    ├── cv_results.csv          – Per-fold CV metrics + mean±std summary row
+    ├── metrics_table_<subset>.csv – Same, on a subset (normal rows, non-templated rows, …)
+    ├── significance.csv        – Bootstrap 95% CIs and paired tests vs the best baseline
+    ├── cv_results.csv         – Per-fold CV metrics + mean±std summary row
     ├── predictions.csv         – Per-sample y_true / y_pred_raw / y_pred_final / overrides
     ├── feature_importances.csv – XGBoost feature importance ranking
     ├── run_config.json         – Dataset, epochs, seed, timestamp …
@@ -20,11 +22,14 @@ import io
 import json
 import os
 import sys
-import textwrap
 from datetime import datetime
 
 import numpy as np
 import pandas as pd
+
+from src.config import NUM_ADVERSARIAL
+from src.data.dataset import adversarial_category_ranges
+from src.models.answer_scorer import AnswerScorer
 
 
 # ─── Stdout tee ───────────────────────────────────────────────────────────────
@@ -68,11 +73,7 @@ class ResultsSaver:
         Optional label prepended to the folder name (e.g. ``"train"``).
     """
 
-    FEATURE_NAMES = [
-        'base_sim', 'graph_sim', 'penalty', 'entity_mm', 'coverage', 'neg_mm',
-        'sim*pen', 'sim*ent', 'grph*pen', 'pen*ent', 'sim_diff', 'avg_sim',
-        'max_pen', 'cov*sim', 'neg*sim',
-    ]
+    FEATURE_NAMES = AnswerScorer.FEATURE_NAMES
 
     def __init__(self, base_dir: str = 'results', label: str = 'run'):
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -82,7 +83,9 @@ class ResultsSaver:
         # Internal state
         self._tee          = None
         self._metrics      = []          # list[dict] from compute_full_metrics
-        self._cv_folds     = []          # list[dict] per fold
+        self._subsets      = {}          # label -> (description, list[dict]) for test subsets
+        self._significance = []          # list[dict] from paired_bootstrap
+        self._cv_folds    = []          # list[dict] per fold
         self._cv_summary   = {}          # mean/std summary
         self._config       = {}
         self._pred_df      = None        # DataFrame
@@ -130,6 +133,14 @@ class ResultsSaver:
         """
         self._metrics.extend(metrics_list)
 
+    def add_subset_metrics(self, label: str, metrics_list: list, description: str = ''):
+        """Register metric dicts computed on a test subset (saved as metrics_table_<label>.csv)."""
+        self._subsets[label] = (description or label, list(metrics_list))
+
+    def add_significance(self, rows: list):
+        """Register significance rows (dicts with subset, model, baseline, metric, …)."""
+        self._significance.extend(rows)
+
     def add_cv_fold(self, fold: int, pearson: float, mae: float, f1: float):
         """Register results for one CV fold."""
         self._cv_folds.append({'fold': fold, 'pearson': pearson,
@@ -169,6 +180,8 @@ class ResultsSaver:
         for i in range(n):
             row = {
                 'idx':           i,
+                **({'templated': bool(test_df.iloc[i]['templated'])}
+                   if 'templated' in test_df.columns else {}),
                 'question':      test_df.iloc[i].get('question', ''),
                 'reference':     test_df.iloc[i].get('reference_answer', ''),
                 'student':       test_df.iloc[i].get('student_answer', ''),
@@ -199,12 +212,22 @@ class ResultsSaver:
     # ── Persistence ───────────────────────────────────────────────────────────
 
     def save_metrics_table(self):
-        if not self._metrics:
+        self._write_metrics_csv(self._metrics, 'metrics_table.csv')
+        for label, (_, metrics) in self._subsets.items():
+            self._write_metrics_csv(metrics, f'metrics_table_{label}.csv')
+        if self._significance:
+            path = os.path.join(self.output_dir, 'significance.csv')
+            pd.DataFrame(self._significance).round(4).to_csv(path, index=False)
+            print(f'[ResultsSaver] Saved → {path}')
+
+    def _write_metrics_csv(self, metrics: list, filename: str):
+        if not metrics:
             return
         rows = []
-        for m in self._metrics:
+        for m in metrics:
             rows.append({
                 'model':       m['name'],
+                'n':           m.get('n'),
                 'pearson':     round(m['pearson'],  4),
                 'spearman':    round(m['spearman'], 4),
                 'mae':         round(m['mae'],      2),
@@ -217,8 +240,9 @@ class ResultsSaver:
                 'cls_prec':    round(m['cls_prec'], 1),
                 'cls_rec':     round(m['cls_rec'],  1),
                 'cls_f1':      round(m['cls_f1'],   1),
+                'cls_f1_macro': round(m['cls_f1_macro'], 1),
             })
-        path = os.path.join(self.output_dir, 'metrics_table.csv')
+        path = os.path.join(self.output_dir, filename)
         pd.DataFrame(rows).to_csv(path, index=False)
         print(f'[ResultsSaver] Saved → {path}')
 
@@ -269,33 +293,19 @@ class ResultsSaver:
         with open(path, 'w', encoding='utf-8') as f:
             f.write(log_text)
         print(f'[ResultsSaver] Saved → {path}')
-    def add_adversarial_breakdown(self, num_adversarial: int = 50):
+    def add_adversarial_breakdown(self, num_adversarial: int = NUM_ADVERSARIAL):
         """
         Derive per-category adversarial metrics from the already-registered
         predictions.  Must be called after add_predictions().
 
-        The 50 adversarial rows are assumed to follow this layout
-        (matches _ADVERSARIAL_SAMPLES in dataset.py):
-          rows  0-16 : Karak Reversal   (17 samples)
-          rows 17-33 : Negation         (17 samples)
-          rows 34-37 : Wrong Number     (4 samples)
-          rows 38-39 : Wrong Location   (2 samples)
-          rows 40    : Partial Cover    (1 sample)
-          rows 41-49 : Voice Change     (9 samples)
+        The adversarial rows are the last *num_adversarial* predictions, laid
+        out as in ADVERSARIAL_CATEGORIES (src/data/dataset.py).
         """
         if self._pred_df is None:
             return
         adv_df = self._pred_df.tail(min(num_adversarial, len(self._pred_df))).reset_index(drop=True)
-        categories = [
-            ('Karak Reversal',  list(range(0,  17))),
-            ('Negation',        list(range(17, 34))),
-            ('Wrong Number',    list(range(34, 38))),
-            ('Wrong Location',  list(range(38, 40))),
-            ('Partial Cover',   [40]),
-            ('Voice Change',    list(range(41, min(num_adversarial, 50)))),
-        ]
         rows = []
-        for cat, idxs in categories:
+        for cat, idxs in adversarial_category_ranges():
             valid = [i for i in idxs if i < len(adv_df)]
             if not valid:
                 continue
@@ -466,8 +476,8 @@ class ResultsSaver:
                 '',
                 '### Tolerance-Based Accuracy',
                 '',
-                '| Model | ±10% | ±15% | ±20% |',
-                '|-------|------|------|------|',
+                '| Model | ±10 pts | ±15 pts | ±20 pts |',
+                '|-------|---------|---------|---------|',
             ]
             for m in self._metrics:
                 lines.append(
@@ -476,16 +486,47 @@ class ResultsSaver:
                 )
             lines += [
                 '',
-                '### Classification Metrics (≥50 = correct)',
+                '### Classification Metrics (≥50 = pass; F1 = PASS class)',
                 '',
-                '| Model | Accuracy | Precision | Recall | F1 |',
-                '|-------|----------|-----------|--------|----|',
+                '| Model | Accuracy | Precision | Recall | F1 | Macro F1 |',
+                '|-------|----------|-----------|--------|----|----------|',
             ]
             for m in self._metrics:
                 lines.append(
                     f"| {m['name']} | {m['cls_acc']:.1f}% | {m['cls_prec']:.1f}% "
-                    f"| {m['cls_rec']:.1f}% | {m['cls_f1']:.1f}% |"
+                    f"| {m['cls_rec']:.1f}% | {m['cls_f1']:.1f}% | {m['cls_f1_macro']:.1f}% |"
                 )
+            lines.append('')
+
+        for label, (description, metrics) in self._subsets.items():
+            if not metrics:
+                continue
+            lines += [
+                f"### {description} (n={metrics[0].get('n', '?')})",
+                '',
+                '| Model | Pearson | MAE | ±10 pts | F1 | Macro F1 |',
+                '|-------|---------|-----|---------|----|----------|',
+            ]
+            for m in metrics:
+                lines.append(
+                    f"| {m['name']} | {m['pearson']:.4f} | {m['mae']:.2f} "
+                    f"| {m['within_10']:.1f}% | {m['cls_f1']:.1f}% | {m['cls_f1_macro']:.1f}% |"
+                )
+            lines.append('')
+
+        if self._significance:
+            lines += [
+                '### Significance (paired bootstrap, 95% CI)',
+                '',
+                '| Subset | Model | vs | Metric | Value [95% CI] | Difference [95% CI] | p |',
+                '|--------|-------|----|--------|----------------|---------------------|---|',
+            ]
+            for r in self._significance:
+                lines.append(
+                    f"| {r['subset']} | {r['model']} | {r['baseline']} | {r['metric']} "
+                    f"| {r['value']:.3f} [{r['ci_low']:.3f}, {r['ci_high']:.3f}] "
+                    f"| {r['diff']:+.3f} [{r['diff_ci_low']:+.3f}, {r['diff_ci_high']:+.3f}] "
+                    f"| {r['p_value']:.3f} |")
             lines.append('')
 
         # ── CV results ────────────────────────────────────────────────────────
@@ -554,9 +595,8 @@ class ResultsSaver:
 
     # ── Master save ───────────────────────────────────────────────────────────
 
-    def save_all(self, num_adversarial: int = 50, generate_plots: bool = True):
-        """Stop log capture and flush everything to disk, then generate figures."""
-        log_text = self._stop_log_capture()
+    def save_all(self, num_adversarial: int = NUM_ADVERSARIAL, generate_plots: bool = True):
+        """Flush everything to disk and generate figures, then save the console log."""
         self.save_metrics_table()
         self.save_cv_results()
         self.save_predictions()
@@ -567,8 +607,6 @@ class ResultsSaver:
         self.save_error_analysis()
         self.save_run_config()
         self.save_summary_markdown()
-        if log_text:
-            self.save_console_log(log_text)
 
         # Auto-generate figures
         if generate_plots:
@@ -580,4 +618,8 @@ class ResultsSaver:
                 print(f'[ResultsSaver] Plot generation skipped: {e}')
 
         print(f'\n[ResultsSaver] All outputs saved to: {self.output_dir}')
+        # Stop capturing last, so the save / plot messages above are in the log
+        log_text = self._stop_log_capture()
+        if log_text:
+            self.save_console_log(log_text)
         return self.output_dir
